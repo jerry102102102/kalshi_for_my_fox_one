@@ -1,0 +1,2 @@
+"""Kalshi market-data adapters."""
+
