@@ -174,7 +174,32 @@ uv run --no-editable ksr report-season-validation-summary
 
 Season reports are written under `data/reports/season_to_date/`. Candle-level replay is a proxy only; full orderbook replay requires live-recorded orderbook snapshots over the game windows.
 
-## 10. Known Limitations
+## 10. Data Strategy
+
+The current conclusion is:
+
+- MLB historical game data exists and is usable for model-only validation.
+- Kalshi has live baseball/pro-baseball markets, but the current historical pull did not find enough automatically mapped MLB game markets, candles, or orderbook overlap for a trading backtest.
+- Official Kalshi markets, candlesticks, and trades should remain the primary source when tickers are known.
+- Full historical orderbook replay is not recoverable from the current official historical endpoints unless orderbook snapshots were recorded live or a third-party dataset provides them.
+
+Run live collection now so future backtests have first-party executable market data:
+
+```bash
+uv run --no-editable ksr discover-markets --query baseball --status open --limit 500
+uv run --no-editable ksr record-kalshi --tickers <REAL_BASEBALL_TICKERS> --duration 86400 --book-snapshots-interval 10
+uv run --no-editable ksr record-mlb --date today --duration 86400
+```
+
+Use older public datasets, such as `TrevorJS/kalshi-trades` on Hugging Face, only as a proxy backtest source:
+
+- Good for testing import, market filtering, settlement labels, trade/candle proxy replay, PnL reports, and calibration plumbing.
+- Not enough by itself for 2026 MLB season-to-date validation because the visible dataset coverage ends before the 2026 MLB season-to-date window.
+- Not a full executable orderbook replay unless the dataset includes historical depth snapshots.
+
+The server-side priority is to start first-party live collection, then add a Hugging Face import path to exercise the trading pipeline while fresh Kalshi baseball orderbook data accumulates.
+
+## 11. Known Limitations
 
 - Kalshi WebSocket delta reconstruction is conservative: raw WS messages are stored, and normalized snapshots are refreshed through REST after WS updates.
 - The MLB win probability model is a hand-built baseline, not trained/calibrated on historical MLB data.
@@ -183,7 +208,7 @@ Season reports are written under `data/reports/season_to_date/`. Candle-level re
 - No true live trading executor is implemented; the guard intentionally rejects live orders.
 - If there is no live MLB game or no open Kalshi MLB market, latency/edge reports will be empty with blocking reasons.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 - `Missing KALSHI_API_KEY_ID`: set `KALSHI_API_KEY_ID`.
 - `Missing KALSHI_PRIVATE_KEY_PATH`: set a readable PEM private key path.
