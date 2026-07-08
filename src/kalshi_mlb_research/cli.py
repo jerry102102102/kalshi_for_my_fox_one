@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from dataclasses import asdict
@@ -62,6 +63,20 @@ def _active_game(status: str | None) -> bool:
         return False
     inactive = ("scheduled", "pre-game", "warmup", "final", "game over", "postponed", "cancelled")
     return not any(term in normalized for term in inactive)
+
+
+def _final_game(status: str | None) -> bool:
+    normalized = (status or "").lower()
+    return "final" in normalized or "game over" in normalized or "completed" in normalized
+
+
+def _table_exists(store: DuckDBStore, table: str) -> bool:
+    return bool(store.fetch_all("SELECT 1 FROM information_schema.tables WHERE table_name = ? LIMIT 1", [table]))
+
+
+def _count(store: DuckDBStore, query: str, params: list[Any] | None = None) -> int:
+    rows = store.fetch_all(query, params or [])
+    return int(rows[0]["count"] or 0) if rows else 0
 
 
 def _store_kalshi_snapshot(
@@ -902,6 +917,526 @@ def _edge_samples(target_date: Date, latency_ms: int = 0) -> list[dict[str, Any]
     return samples
 
 
+def _backtest_readiness(target_date: Date) -> dict[str, Any]:
+    store = DuckDBStore()
+    try:
+        metrics = {
+            "mapped_games": _count(
+                store,
+                """
+                SELECT COUNT(DISTINCT m.game_pk) AS count
+                FROM market_game_mappings m
+                WHERE CAST(m.created_at_utc AS DATE)=?
+                   OR m.game_pk IN (SELECT DISTINCT game_pk FROM mlb_game_states WHERE game_date=?)
+                """,
+                [target_date.isoformat(), target_date.isoformat()],
+            ),
+            "mlb_state_count": _count(store, "SELECT COUNT(*) AS count FROM mlb_game_states WHERE game_date=?", [target_date.isoformat()]),
+            "sports_event_count": _count(
+                store,
+                """
+                SELECT COUNT(*) AS count
+                FROM sports_events
+                WHERE CAST(observed_at_utc AS DATE)=?
+                   OR game_pk IN (SELECT DISTINCT game_pk FROM mlb_game_states WHERE game_date=?)
+                """,
+                [target_date.isoformat(), target_date.isoformat()],
+            ),
+            "kalshi_snapshot_count": _count(
+                store,
+                "SELECT COUNT(*) AS count FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE)=?",
+                [target_date.isoformat()],
+            ),
+            "paper_fill_count": _count(
+                store,
+                "SELECT COUNT(*) AS count FROM paper_fills WHERE CAST(observed_at_utc AS DATE)=?",
+                [target_date.isoformat()],
+            ),
+        }
+    finally:
+        store.close()
+
+    samples = _edge_samples(target_date)
+    metrics["edge_sample_count"] = len(samples)
+    metrics["candidate_trade_count"] = sum(1 for sample in samples if sample.get("decision") != "HOLD")
+
+    thresholds = {
+        "mapped_games": 1,
+        "mlb_state_count": 50,
+        "sports_event_count": 20,
+        "kalshi_snapshot_count": 100,
+        "edge_sample_count": 20,
+    }
+    missing_map = {
+        "mapped_games": "no mapped markets",
+        "mlb_state_count": "no MLB states",
+        "sports_event_count": "no sports events",
+        "kalshi_snapshot_count": "no Kalshi snapshots",
+        "edge_sample_count": "no edge samples",
+    }
+    missing = [reason for metric, reason in missing_map.items() if metrics[metric] == 0]
+    go = all(metrics[metric] >= threshold for metric, threshold in thresholds.items())
+    gate_status = "GO" if go else ("NO_GO" if missing else "WATCH")
+    rows = []
+    for metric, value in metrics.items():
+        threshold = thresholds.get(metric)
+        if threshold is None:
+            status = "INFO"
+        elif value >= threshold:
+            status = "GO"
+        elif value == 0:
+            status = "NO_GO"
+        else:
+            status = "WATCH"
+        rows.append({"metric": metric, "value": value, "go_threshold": threshold, "status": status})
+    return {
+        "status": "READY" if go else "INSUFFICIENT_BACKTEST_DATA",
+        "gate_status": gate_status,
+        "missing": missing,
+        "metrics": metrics,
+        "rows": rows,
+    }
+
+
+def _write_backtest_readiness_report(target_date: Date, readiness: dict[str, Any]) -> tuple[Any, Any]:
+    md_path, csv_path = _report_paths(target_date, "backtest_readiness")
+    lines = ["# Backtest Readiness", "", str(readiness["status"]), ""]
+    if readiness["status"] != "READY":
+        lines.extend(["missing:"])
+        if readiness["missing"]:
+            lines.extend(f"- {reason}" for reason in readiness["missing"])
+        else:
+            lines.append("- sample counts are below GO thresholds")
+        lines.append("")
+    columns = ["metric", "value", "go_threshold", "status"]
+    lines.extend(
+        [
+            "| " + " | ".join(columns) + " |",
+            "| " + " | ".join("---" for _ in columns) + " |",
+        ]
+    )
+    for row in readiness["rows"]:
+        lines.append("| " + " | ".join(str(row.get(column, "")) for column in columns) + " |")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_csv(csv_path, readiness["rows"])
+    return md_path, csv_path
+
+
+def _play_timestamp(play: dict, index: int, fallback_start: datetime) -> datetime:
+    about = play.get("about", {}) or {}
+    return (
+        parse_iso_datetime(about.get("endTime"))
+        or parse_iso_datetime(about.get("startTime"))
+        or (fallback_start + timedelta(seconds=index))
+    )
+
+
+def _runner_bases_after_play(play: dict) -> tuple[bool, bool, bool]:
+    occupied = {"1B": False, "2B": False, "3B": False}
+    for runner in play.get("runners", []) or []:
+        movement = runner.get("movement", {}) or {}
+        end_base = str(movement.get("end") or "")
+        if end_base in occupied and not movement.get("isOut"):
+            occupied[end_base] = True
+    return occupied["1B"], occupied["2B"], occupied["3B"]
+
+
+def _person_id_from_play(value: dict | None) -> str | None:
+    if not value:
+        return None
+    raw = value.get("id")
+    return str(raw) if raw is not None else None
+
+
+def _historical_state_from_play(
+    payload: dict,
+    play: dict,
+    index: int,
+    play_count: int,
+    target_date: Date,
+    previous_score: tuple[int, int],
+) -> MLBGameState:
+    game_data = payload.get("gameData", {}) or {}
+    teams = game_data.get("teams", {}) or {}
+    about = play.get("about", {}) or {}
+    result = play.get("result", {}) or {}
+    count = play.get("count", {}) or {}
+    matchup = play.get("matchup", {}) or {}
+    fallback_start = (
+        parse_iso_datetime(game_data.get("datetime", {}).get("dateTime"))
+        or datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc)
+    )
+    observed = _play_timestamp(play, index, fallback_start)
+    half = str(about.get("halfInning") or "top").lower()
+    first, second, third = _runner_bases_after_play(play)
+    home_score = int(result["homeScore"]) if result.get("homeScore") is not None else previous_score[0]
+    away_score = int(result["awayScore"]) if result.get("awayScore") is not None else previous_score[1]
+    return MLBGameState(
+        game_pk=str(payload.get("gamePk") or game_data.get("game", {}).get("pk") or ""),
+        observed_at_utc=observed,
+        source_event_time_utc=observed,
+        status=str(game_data.get("status", {}).get("detailedState") or "Final") if index == play_count - 1 else "Historical Replay",
+        home_team=str(teams.get("home", {}).get("name") or ""),
+        away_team=str(teams.get("away", {}).get("name") or ""),
+        inning=int(about.get("inning") or 1),
+        half_inning="bottom" if half.startswith("bot") else "top",
+        home_score=home_score,
+        away_score=away_score,
+        outs=int(count.get("outs") or 0),
+        balls=int(count.get("balls") or 0),
+        strikes=int(count.get("strikes") or 0),
+        runner_on_first=first,
+        runner_on_second=second,
+        runner_on_third=third,
+        batter_id=_person_id_from_play(matchup.get("batter")),
+        pitcher_id=_person_id_from_play(matchup.get("pitcher")),
+        last_play_type=result.get("eventType") or result.get("event"),
+        last_play_description=result.get("description"),
+        raw_payload={"play_index": index, "play": play},
+    )
+
+
+@app.command("build-historical-replay-dataset")
+def build_historical_replay_dataset(date: Annotated[str, typer.Option("--date")]) -> None:
+    target_date = parse_date_arg(date)
+    store = DuckDBStore()
+    client = MLBClient()
+    normalizer = SportsEventNormalizer()
+    games_count = 0
+    states_count = 0
+    events_count = 0
+    blockers: list[str] = []
+    try:
+        games = client.schedule(target_date)
+        store.conn.execute("DELETE FROM mlb_schedule WHERE game_date=?", [target_date.isoformat()])
+        _store_mlb_schedule(store, target_date, games)
+        final_games = [game for game in games if _final_game(str(game.get("status")))]
+        if not final_games:
+            blockers.append("no final games for date")
+        for game in final_games:
+            game_pk = str(game["game_pk"])
+            payload = client.live_game(game_pk)
+            plays = payload.get("liveData", {}).get("plays", {}).get("allPlays", []) or []
+            if not plays:
+                blockers.append(f"{game_pk}: no play-by-play events")
+                continue
+            store.conn.execute("DELETE FROM sports_events WHERE game_pk=?", [game_pk])
+            store.conn.execute("DELETE FROM mlb_game_states WHERE game_pk=? AND game_date=?", [game_pk, target_date.isoformat()])
+            games_count += 1
+            previous: MLBGameState | None = None
+            score = (0, 0)
+            for index, play in enumerate(plays):
+                state = _historical_state_from_play(payload, play, index, len(plays), target_date, score)
+                score = (state.home_score, state.away_score)
+                _store_mlb_state(store, state, target_date)
+                _store_sports_event(store, normalizer.normalize(previous, state))
+                previous = state
+                states_count += 1
+                events_count += 1
+    except Exception as exc:
+        blockers.append(str(exc))
+        raise typer.Exit(1)
+    finally:
+        client.close()
+        store.close()
+
+    readiness = _backtest_readiness(target_date)
+    model_only_ready = states_count > 0 and events_count > 0
+    market_ready = readiness["metrics"]["edge_sample_count"] > 0
+    _echo_json(
+        {
+            "status": "COMPLETED" if model_only_ready else "INSUFFICIENT_BACKTEST_DATA",
+            "date": target_date,
+            "historical_games_count": games_count,
+            "historical_events_count": events_count,
+            "historical_states_count": states_count,
+            "model_only_replay_ready": model_only_ready,
+            "market_replay_ready": market_ready,
+            "blocking_reasons": blockers,
+        }
+    )
+
+
+def _model_only_backtest(target_date: Date) -> dict[str, Any]:
+    store = DuckDBStore()
+    try:
+        state_rows = store.fetch_all(
+            "SELECT * FROM mlb_game_states WHERE game_date=? ORDER BY game_pk, observed_at_utc",
+            [target_date.isoformat()],
+        )
+    finally:
+        store.close()
+
+    if not state_rows:
+        return {
+            "status": "INSUFFICIENT_BACKTEST_DATA",
+            "blocking_reasons": ["no MLB states for date"],
+            "predictions": [],
+            "metrics": [],
+            "calibration_bins": [],
+        }
+
+    states_by_game: dict[str, list[MLBGameState]] = {}
+    for row in state_rows:
+        state = _state_from_stored_json(row["state"])
+        states_by_game.setdefault(state.game_pk, []).append(state)
+
+    labels: dict[str, int] = {}
+    for game_pk, states in states_by_game.items():
+        final_state = states[-1]
+        if final_state.home_score == final_state.away_score:
+            continue
+        labels[game_pk] = 1 if final_state.home_score > final_state.away_score else 0
+
+    if not labels:
+        return {
+            "status": "INSUFFICIENT_BACKTEST_DATA",
+            "blocking_reasons": ["no final result labels"],
+            "predictions": [],
+            "metrics": [],
+            "calibration_bins": [],
+        }
+
+    model = MLBWinProbabilityModel()
+    predictions: list[dict[str, Any]] = []
+    for game_pk, states in states_by_game.items():
+        if game_pk not in labels:
+            continue
+        label = labels[game_pk]
+        for state in states:
+            prediction = model.predict(state)
+            probability = prediction.home_win_p_mid
+            predictions.append(
+                {
+                    "observed_at_utc": state.observed_at_utc.isoformat(),
+                    "game_pk": game_pk,
+                    "home_team": state.home_team,
+                    "away_team": state.away_team,
+                    "inning": state.inning,
+                    "half_inning": state.half_inning,
+                    "home_score": state.home_score,
+                    "away_score": state.away_score,
+                    "home_win_p": probability,
+                    "home_win_label": label,
+                    "predicted_home_win": probability >= 0.5,
+                    "correct": (probability >= 0.5) == bool(label),
+                }
+            )
+
+    if not predictions:
+        return {
+            "status": "INSUFFICIENT_BACKTEST_DATA",
+            "blocking_reasons": ["no model prediction samples"],
+            "predictions": [],
+            "metrics": [],
+            "calibration_bins": [],
+        }
+
+    sample_count = len(predictions)
+    brier = sum((float(row["home_win_p"]) - int(row["home_win_label"])) ** 2 for row in predictions) / sample_count
+    log_loss = 0.0
+    for row in predictions:
+        p = min(0.999999, max(0.000001, float(row["home_win_p"])))
+        y = int(row["home_win_label"])
+        log_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+    log_loss /= sample_count
+    accuracy = sum(1 for row in predictions if row["correct"]) / sample_count
+
+    bins: list[dict[str, Any]] = []
+    distribution: dict[str, int] = {}
+    for bin_index in range(5):
+        low = bin_index / 5
+        high = (bin_index + 1) / 5
+        label = f"{low:.1f}-{high:.1f}"
+        bucket = [
+            row
+            for row in predictions
+            if bin_index == min(int(float(row["home_win_p"]) * 5), 4)
+        ]
+        distribution[label] = len(bucket)
+        bins.append(
+            {
+                "bin": label,
+                "sample_count": len(bucket),
+                "avg_prediction": (sum(float(row["home_win_p"]) for row in bucket) / len(bucket)) if bucket else None,
+                "actual_home_win_rate": (sum(int(row["home_win_label"]) for row in bucket) / len(bucket)) if bucket else None,
+            }
+        )
+
+    extreme = {
+        "home_p_ge_0_9_count": sum(1 for row in predictions if float(row["home_win_p"]) >= 0.9),
+        "home_p_le_0_1_count": sum(1 for row in predictions if float(row["home_win_p"]) <= 0.1),
+        "wrong_extreme_count": sum(
+            1
+            for row in predictions
+            if (float(row["home_win_p"]) >= 0.9 and not row["home_win_label"])
+            or (float(row["home_win_p"]) <= 0.1 and row["home_win_label"])
+        ),
+    }
+    metrics = [
+        {"metric": "sample_count", "value": sample_count},
+        {"metric": "brier_score", "value": round(brier, 6)},
+        {"metric": "log_loss", "value": round(log_loss, 6)},
+        {"metric": "calibration_bins", "value": bins},
+        {"metric": "home_win_p_distribution", "value": distribution},
+        {"metric": "final_result_accuracy", "value": round(accuracy, 6)},
+        {"metric": "extreme_state_sanity_checks", "value": extreme},
+    ]
+    return {
+        "status": "COMPLETED",
+        "blocking_reasons": [],
+        "predictions": predictions,
+        "metrics": metrics,
+        "calibration_bins": bins,
+    }
+
+
+@app.command("backtest-model-only")
+def backtest_model_only(date: Annotated[str, typer.Option("--date")]) -> None:
+    target_date = parse_date_arg(date)
+    result = _model_only_backtest(target_date)
+    directory = report_dir(load_settings().reports_dir, target_date)
+    md_path = directory / "model_only_backtest.md"
+    predictions_path = directory / "model_only_predictions.csv"
+    bins_path = directory / "calibration_bins.csv"
+    if result["status"] == "COMPLETED":
+        write_markdown_table(md_path, "Model Only Backtest", result["metrics"])
+    else:
+        write_markdown_table(
+            md_path,
+            "Model Only Backtest",
+            [],
+            note="INSUFFICIENT_BACKTEST_DATA\n\nmissing:\n" + "\n".join(f"- {reason}" for reason in result["blocking_reasons"]),
+        )
+    write_csv(predictions_path, result["predictions"])
+    write_csv(bins_path, result["calibration_bins"])
+    _echo_json(
+        {
+            "status": result["status"],
+            "blocking_reasons": result["blocking_reasons"],
+            "sample_count": len(result["predictions"]),
+            "markdown": str(md_path),
+            "predictions_csv": str(predictions_path),
+            "calibration_bins_csv": str(bins_path),
+            "metrics": result["metrics"],
+        }
+    )
+
+
+def _market_replay_readiness(target_date: Date) -> dict[str, Any]:
+    readiness = _backtest_readiness(target_date)
+    store = DuckDBStore()
+    try:
+        mapped_ticker_count = _count(
+            store,
+            """
+            SELECT COUNT(DISTINCT kalshi_ticker) AS count
+            FROM market_game_mappings
+            WHERE CAST(created_at_utc AS DATE)=?
+               OR game_pk IN (SELECT DISTINCT game_pk FROM mlb_game_states WHERE game_date=?)
+            """,
+            [target_date.isoformat(), target_date.isoformat()],
+        )
+        kalshi_trade_count = _count(
+            store,
+            """
+            SELECT COUNT(*) AS count
+            FROM kalshi_ws_raw
+            WHERE CAST(observed_at_utc AS DATE)=?
+              AND lower(channel) LIKE '%trade%'
+            """,
+            [target_date.isoformat()],
+        )
+        historical_candle_count = (
+            _count(store, "SELECT COUNT(*) AS count FROM historical_market_candles WHERE CAST(observed_at_utc AS DATE)=?", [target_date.isoformat()])
+            if _table_exists(store, "historical_market_candles")
+            else 0
+        )
+        overlap_rows = store.fetch_all(
+            """
+            WITH mapped AS (
+              SELECT DISTINCT game_pk, kalshi_ticker FROM market_game_mappings
+            ),
+            state_window AS (
+              SELECT m.kalshi_ticker, MIN(s.observed_at_utc) AS state_start, MAX(s.observed_at_utc) AS state_end
+              FROM mapped m
+              JOIN mlb_game_states s ON s.game_pk=m.game_pk
+              WHERE s.game_date=?
+              GROUP BY m.kalshi_ticker
+            ),
+            book_window AS (
+              SELECT ticker, MIN(observed_at_utc) AS book_start, MAX(observed_at_utc) AS book_end
+              FROM kalshi_orderbook_snapshots
+              WHERE CAST(observed_at_utc AS DATE)=?
+              GROUP BY ticker
+            )
+            SELECT sw.kalshi_ticker, sw.state_start, sw.state_end, bw.book_start, bw.book_end
+            FROM state_window sw
+            JOIN book_window bw ON bw.ticker=sw.kalshi_ticker
+            """,
+            [target_date.isoformat(), target_date.isoformat()],
+        )
+    finally:
+        store.close()
+
+    overlap_seconds = 0.0
+    for row in overlap_rows:
+        start = max(ensure_utc(row["state_start"]), ensure_utc(row["book_start"]))
+        end = min(ensure_utc(row["state_end"]), ensure_utc(row["book_end"]))
+        overlap_seconds = max(overlap_seconds, (end - start).total_seconds())
+    overlap_time_window = "NONE" if overlap_seconds <= 0 else f"{int(overlap_seconds)}s"
+
+    metrics = {
+        "kalshi_snapshot_count": readiness["metrics"]["kalshi_snapshot_count"],
+        "kalshi_trade_count": kalshi_trade_count,
+        "historical_candle_count": historical_candle_count,
+        "mapped_ticker_count": mapped_ticker_count,
+        "overlap_time_window": overlap_time_window,
+        "edge_sample_count": readiness["metrics"]["edge_sample_count"],
+        "mlb_state_count": readiness["metrics"]["mlb_state_count"],
+        "sports_event_count": readiness["metrics"]["sports_event_count"],
+    }
+    model_only_ready = metrics["mlb_state_count"] > 0 and metrics["sports_event_count"] > 0
+    market_data_available = metrics["kalshi_snapshot_count"] > 0 or kalshi_trade_count > 0 or historical_candle_count > 0
+    market_ready = (
+        mapped_ticker_count > 0
+        and market_data_available
+        and overlap_time_window != "NONE"
+        and readiness["metrics"]["edge_sample_count"] > 0
+    )
+    if market_ready:
+        status = "MARKET_REPLAY_READY"
+        message = "Market replay can run with mapped tickers and overlapping market/state samples."
+    elif model_only_ready:
+        status = "MODEL_ONLY_READY"
+        message = "Model-only backtest available, but market replay is not available because Kalshi historical orderbook/trade data is missing."
+    else:
+        status = "NO_GO"
+        message = "Insufficient MLB historical states/events for model-only or market replay."
+    rows = [{"metric": key, "value": value} for key, value in metrics.items()]
+    return {"status": status, "message": message, "metrics": metrics, "rows": rows}
+
+
+@app.command("report-market-replay-readiness")
+def report_market_replay_readiness(date: Annotated[str, typer.Option("--date")]) -> None:
+    target_date = parse_date_arg(date)
+    result = _market_replay_readiness(target_date)
+    md_path, csv_path = _report_paths(target_date, "market_replay_readiness")
+    write_markdown_table(md_path, "Market Replay Readiness", result["rows"], note=result["message"])
+    with md_path.open("a", encoding="utf-8") as file:
+        file.write(f"\n{result['status']}\n\n{result['message']}\n")
+    write_csv(csv_path, result["rows"])
+    _echo_json(
+        {
+            "status": result["status"],
+            "message": result["message"],
+            "metrics": result["metrics"],
+            "markdown": str(md_path),
+            "csv": str(csv_path),
+        }
+    )
+
+
 @app.command("report-edge")
 def report_edge(date: str = "today") -> None:
     target_date = parse_date_arg(date)
@@ -912,7 +1447,39 @@ def report_edge(date: str = "today") -> None:
     _echo_json({"markdown": str(md_path), "csv": str(csv_path.with_name("edge_samples.csv")), "rows": len(rows)})
 
 
+@app.command("report-backtest-readiness")
+def report_backtest_readiness(date: str = "today") -> None:
+    target_date = parse_date_arg(date)
+    readiness = _backtest_readiness(target_date)
+    md_path, csv_path = _write_backtest_readiness_report(target_date, readiness)
+    _echo_json(
+        {
+            "status": readiness["status"],
+            "gate_status": readiness["gate_status"],
+            "missing": readiness["missing"],
+            "metrics": readiness["metrics"],
+            "markdown": str(md_path),
+            "csv": str(csv_path),
+        }
+    )
+
+
 def _run_paper_replay(target_date: Date, latency_ms: int) -> dict[str, Any]:
+    samples = _edge_samples(target_date, latency_ms=latency_ms)
+    if not samples:
+        return {
+            "status": "INSUFFICIENT_BACKTEST_DATA",
+            "run_id": None,
+            "latency_ms": latency_ms,
+            "edge_sample_count": 0,
+            "trade_count": 0,
+            "fill_count": 0,
+            "blocking_reasons": [
+                "no edge samples",
+                "check mappings, MLB states, sports events, and Kalshi snapshots",
+            ],
+        }
+
     run_id = str(uuid.uuid4())
     broker = PaperBroker()
     risk = RiskManager()
@@ -921,7 +1488,6 @@ def _run_paper_replay(target_date: Date, latency_ms: int) -> dict[str, Any]:
     gross_pnl = Decimal("0")
     estimated_fees = Decimal("0")
     try:
-        samples = _edge_samples(target_date, latency_ms=latency_ms)
         for sample in samples:
             ticker = sample["ticker"]
             if sample["decision"] == "HOLD":
@@ -1004,8 +1570,10 @@ def _run_paper_replay(target_date: Date, latency_ms: int) -> dict[str, Any]:
     finally:
         store.close()
     return {
+        "status": "COMPLETED",
         "run_id": run_id,
         "latency_ms": latency_ms,
+        "edge_sample_count": len(samples),
         "trade_count": len(broker.orders),
         "fill_count": len(broker.fills),
         "skip_count": skip_count,
@@ -1033,9 +1601,29 @@ def compare_latency(date: Annotated[str, typer.Option("--date")]) -> None:
     target_date = parse_date_arg(date)
     rows = [_run_paper_replay(target_date, latency) for latency in [100, 250, 500, 1000, 2000, 5000, 10000, 30000]]
     md_path, csv_path = _report_paths(target_date, "latency_comparison")
+    if not any(row.get("edge_sample_count", 0) for row in rows):
+        payload = {
+            "status": "INSUFFICIENT_BACKTEST_DATA",
+            "rows": 0,
+            "blocking_reasons": [
+                "no edge samples for any latency",
+                "check mappings, MLB states, sports events, and Kalshi snapshots",
+            ],
+            "markdown": str(md_path),
+            "csv": str(csv_path),
+        }
+        write_markdown_table(
+            md_path,
+            "Latency Comparison",
+            [],
+            note="INSUFFICIENT_BACKTEST_DATA\n\nmissing:\n- no edge samples for any latency",
+        )
+        write_csv(csv_path, [])
+        _echo_json(payload)
+        return
     write_markdown_table(md_path, "Latency Comparison", rows)
     write_csv(csv_path, rows)
-    _echo_json({"markdown": str(md_path), "csv": str(csv_path), "rows": rows})
+    _echo_json({"status": "COMPLETED", "markdown": str(md_path), "csv": str(csv_path), "rows": rows})
 
 
 def _gate_status(value: float | int | None, go: float, no_go: float, higher_is_better: bool) -> str:
@@ -1086,26 +1674,88 @@ def report_validation_summary(date: str = "today") -> None:
             """,
             [target_date.isoformat(), load_settings().max_data_staleness_ms],
         )[0]
+        paper_equity_count = _count(
+            store,
+            "SELECT COUNT(*) AS count FROM paper_equity WHERE CAST(observed_at_utc AS DATE)=?",
+            [target_date.isoformat()],
+        )
     finally:
         store.close()
     gap_count = int(gap_rows.get("gap_count") or 0)
     stale_ratio = (int(gap_rows.get("stale_gap_count") or 0) / gap_count) if gap_count else None
+    readiness = _backtest_readiness(target_date)
+    market_readiness = _market_replay_readiness(target_date)
+    model_report = report_dir(load_settings().reports_dir, target_date) / "model_only_predictions.csv"
+    model_result = _model_only_backtest(target_date)
+    if model_report.exists() and model_report.read_text(encoding="utf-8").strip():
+        model_only_status = "COMPLETED"
+    elif model_result["status"] == "COMPLETED":
+        model_only_status = "READY"
+    else:
+        model_only_status = "INSUFFICIENT_DATA"
+    market_replay_status = "READY" if market_readiness["status"] == "MARKET_REPLAY_READY" else "INSUFFICIENT_DATA"
+    paper_replay_status = "COMPLETED" if paper_equity_count else ("READY" if readiness["metrics"]["edge_sample_count"] else "INSUFFICIENT_DATA")
+    backtest_status = "READY" if readiness["status"] == "READY" else "INSUFFICIENT_DATA"
+
+    missing: list[str] = []
+
+    def add_missing(reason: str) -> None:
+        if reason not in missing:
+            missing.append(reason)
+
+    for reason in readiness["missing"]:
+        add_missing(
+            {
+                "no mapped markets": "manual mapping",
+                "no MLB states": "MLB states",
+                "no sports events": "MLB events",
+                "no Kalshi snapshots": "Kalshi historical market data",
+                "no edge samples": "edge samples",
+            }.get(reason, reason)
+        )
+    if market_readiness["metrics"]["mapped_ticker_count"] == 0:
+        add_missing("manual mapping")
+    if market_readiness["metrics"]["kalshi_snapshot_count"] == 0 and market_readiness["metrics"]["kalshi_trade_count"] == 0 and market_readiness["metrics"]["historical_candle_count"] == 0:
+        add_missing("Kalshi historical market data")
+    if market_readiness["metrics"]["edge_sample_count"] == 0:
+        add_missing("edge samples")
+    if market_readiness["metrics"]["sports_event_count"] == 0:
+        add_missing("MLB events")
+
+    can_model = model_only_status in {"READY", "COMPLETED"}
+    can_trade = market_replay_status == "READY"
     rows = [
-        {"gate": "mapped_games", "value": metrics["mapped_games"], "go": 100, "no_go": 30, "status": _gate_status(metrics["mapped_games"], 100, 30, True)},
-        {"gate": "high_impact_events", "value": metrics["high_impact_events"], "go": 1000, "no_go": 300, "status": _gate_status(metrics["high_impact_events"], 1000, 300, True)},
-        {"gate": "state_snapshots", "value": metrics["state_snapshots"], "go": 5000, "no_go": 1500, "status": _gate_status(metrics["state_snapshots"], 5000, 1500, True)},
-        {"gate": "kalshi_stale_ratio", "value": round(stale_ratio, 4) if stale_ratio is not None else None, "go": 0.20, "no_go": 0.35, "status": _gate_status(stale_ratio, 0.20, 0.35, False)},
-        {"gate": "median_spread", "value": metrics["median_spread"], "go": 0.05, "no_go": 0.08, "status": _gate_status(float(metrics["median_spread"]), 0.05, 0.08, False)},
-        {"gate": "average_spread", "value": metrics["average_spread"], "go": 0.08, "no_go": 0.12, "status": _gate_status(float(metrics["average_spread"]), 0.08, 0.12, False)},
-        {"gate": "median_yes_bid_depth", "value": metrics["median_bid_depth"], "go": 5, "no_go": 3, "status": _gate_status(metrics["median_bid_depth"], 5, 3, True)},
-        {"gate": "median_yes_ask_depth", "value": metrics["median_ask_depth"], "go": 5, "no_go": 3, "status": _gate_status(metrics["median_ask_depth"], 5, 3, True)},
+        {"metric": "backtest_status", "value": backtest_status, "status": backtest_status, "go": "", "no_go": "", "detail": readiness["gate_status"]},
+        {"metric": "model_only_backtest_status", "value": model_only_status, "status": model_only_status, "go": "", "no_go": "", "detail": ""},
+        {"metric": "market_replay_status", "value": market_replay_status, "status": market_replay_status, "go": "", "no_go": "", "detail": market_readiness["status"]},
+        {"metric": "paper_replay_status", "value": paper_replay_status, "status": paper_replay_status, "go": "", "no_go": "", "detail": ""},
+        {"metric": "can_backtest_probability_model", "value": "yes" if can_model else "no", "status": model_only_status, "go": "", "no_go": "", "detail": ""},
+        {"metric": "can_backtest_trading_strategy", "value": "yes" if can_trade else "no", "status": market_replay_status, "go": "", "no_go": "", "detail": ""},
+        {"metric": "missing_data", "value": "; ".join(missing) if missing else "", "status": "OK" if not missing else "INSUFFICIENT_DATA", "go": "", "no_go": "", "detail": ""},
+        {"metric": "mapped_games", "value": metrics["mapped_games"], "status": _gate_status(metrics["mapped_games"], 100, 30, True), "go": 100, "no_go": 30, "detail": ""},
+        {"metric": "high_impact_events", "value": metrics["high_impact_events"], "status": _gate_status(metrics["high_impact_events"], 1000, 300, True), "go": 1000, "no_go": 300, "detail": ""},
+        {"metric": "state_snapshots", "value": metrics["state_snapshots"], "status": _gate_status(metrics["state_snapshots"], 5000, 1500, True), "go": 5000, "no_go": 1500, "detail": ""},
+        {"metric": "kalshi_stale_ratio", "value": round(stale_ratio, 4) if stale_ratio is not None else None, "status": _gate_status(stale_ratio, 0.20, 0.35, False), "go": 0.20, "no_go": 0.35, "detail": ""},
+        {"metric": "median_spread", "value": metrics["median_spread"], "status": _gate_status(float(metrics["median_spread"]), 0.05, 0.08, False), "go": 0.05, "no_go": 0.08, "detail": ""},
+        {"metric": "average_spread", "value": metrics["average_spread"], "status": _gate_status(float(metrics["average_spread"]), 0.08, 0.12, False), "go": 0.08, "no_go": 0.12, "detail": ""},
+        {"metric": "median_yes_bid_depth", "value": metrics["median_bid_depth"], "status": _gate_status(metrics["median_bid_depth"], 5, 3, True), "go": 5, "no_go": 3, "detail": ""},
+        {"metric": "median_yes_ask_depth", "value": metrics["median_ask_depth"], "status": _gate_status(metrics["median_ask_depth"], 5, 3, True), "go": 5, "no_go": 3, "detail": ""},
     ]
     directory = report_dir(load_settings().reports_dir, target_date)
     md_path = directory / "first_real_validation_summary.md"
     csv_path = directory / "first_real_validation_summary.csv"
     write_markdown_table(md_path, "First Real Validation Summary", rows)
     write_csv(csv_path, rows)
-    _echo_json({"markdown": str(md_path), "csv": str(csv_path), "rows": rows})
+    _echo_json(
+        {
+            "markdown": str(md_path),
+            "csv": str(csv_path),
+            "can_backtest_probability_model": can_model,
+            "can_backtest_trading_strategy": can_trade,
+            "missing_data": missing,
+            "rows": rows,
+        }
+    )
 
 
 @app.command("report-pnl")

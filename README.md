@@ -98,7 +98,9 @@ uv run --no-editable ksr record-odds --sport mlb --date today
 uv run --no-editable ksr report-data-quality --date today
 uv run --no-editable ksr report-latency --date today
 uv run --no-editable ksr report-edge --date today
+uv run --no-editable ksr report-backtest-readiness --date today
 uv run --no-editable ksr compare-latency --date today
+uv run --no-editable ksr report-market-replay-readiness --date today
 uv run --no-editable ksr report-validation-summary --date today
 uv run --no-editable ksr export-parquet
 ```
@@ -112,8 +114,12 @@ data/reports/<date>/latency_report.md
 data/reports/<date>/latency_events.csv
 data/reports/<date>/edge_report.md
 data/reports/<date>/edge_samples.csv
+data/reports/<date>/backtest_readiness.md
+data/reports/<date>/backtest_readiness.csv
 data/reports/<date>/latency_comparison.md
 data/reports/<date>/latency_comparison.csv
+data/reports/<date>/market_replay_readiness.md
+data/reports/<date>/market_replay_readiness.csv
 data/reports/<date>/first_real_validation_summary.md
 data/reports/<date>/first_real_validation_summary.csv
 data/parquet/*.parquet
@@ -140,9 +146,21 @@ Replay applies a latency delay to stored MLB state timestamps and uses executabl
 uv run --no-editable ksr replay --date today --latency-ms 1000
 ```
 
-Output includes `run_id`, trade/fill/skip counts, fees, PnL fields, and drawdown placeholder.
+If there are no edge samples, replay returns `INSUFFICIENT_BACKTEST_DATA` with no `run_id`; `0 trades / 0 fills` is not treated as a completed backtest.
 
-## 9. Known Limitations
+## 9. Historical Backtest
+
+Build a model-only replay dataset from completed MLB games, then run the coarse probability-model backtest:
+
+```bash
+uv run --no-editable ksr build-historical-replay-dataset --date <YYYY-MM-DD>
+uv run --no-editable ksr backtest-model-only --date <YYYY-MM-DD>
+uv run --no-editable ksr report-market-replay-readiness --date <YYYY-MM-DD>
+```
+
+Model-only backtest uses final game result as the label. Market replay still requires manual mapping plus overlapping Kalshi historical orderbook/trade data.
+
+## 10. Known Limitations
 
 - Kalshi WebSocket delta reconstruction is conservative: raw WS messages are stored, and normalized snapshots are refreshed through REST after WS updates.
 - The MLB win probability model is a hand-built baseline, not trained/calibrated on historical MLB data.
@@ -150,7 +168,7 @@ Output includes `run_id`, trade/fill/skip counts, fees, PnL fields, and drawdown
 - No true live trading executor is implemented; the guard intentionally rejects live orders.
 - If there is no live MLB game or no open Kalshi MLB market, latency/edge reports will be empty with blocking reasons.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 - `Missing KALSHI_API_KEY_ID`: set `KALSHI_API_KEY_ID`.
 - `Missing KALSHI_PRIVATE_KEY_PATH`: set a readable PEM private key path.

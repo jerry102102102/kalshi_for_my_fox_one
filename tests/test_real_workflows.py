@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import replace
 from datetime import timedelta
 
 from typer.testing import CliRunner
@@ -176,6 +177,30 @@ def test_replay_deterministic_with_latency(monkeypatch, tmp_path) -> None:
 
     comparable = ["latency_ms", "trade_count", "fill_count", "skip_count", "gross_pnl", "estimated_fees"]
     assert {key: first[key] for key in comparable} == {key: second[key] for key in comparable}
+    assert first["status"] == "COMPLETED"
+
+
+def test_replay_empty_data_is_insufficient(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["replay", "--date", utc_now().date().isoformat(), "--latency-ms", "1000"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "INSUFFICIENT_BACKTEST_DATA"
+    assert payload["run_id"] is None
+    assert payload["edge_sample_count"] == 0
+
+
+def test_backtest_readiness_empty_data(monkeypatch, tmp_path) -> None:
+    _db_path, reports_dir = _configure_tmp(monkeypatch, tmp_path)
+    target_date = utc_now().date()
+
+    result = CliRunner().invoke(app, ["report-backtest-readiness", "--date", target_date.isoformat()])
+
+    assert result.exit_code == 0, result.output
+    assert "INSUFFICIENT_BACKTEST_DATA" in result.output
+    assert (reports_dir / target_date.isoformat() / "backtest_readiness.md").exists()
 
 
 def test_validation_summary_empty_data(monkeypatch, tmp_path) -> None:
@@ -195,6 +220,62 @@ def test_compare_latency_empty_data(monkeypatch, tmp_path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "latency_comparison.md" in result.output
+    assert "INSUFFICIENT_BACKTEST_DATA" in result.output
+
+
+def test_build_historical_dataset_no_final_games(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+
+    class FakeMLBClient:
+        def schedule(self, _date):
+            return [
+                {
+                    "game_pk": "future-game",
+                    "game_date": utc_now().isoformat(),
+                    "status": "Scheduled",
+                    "home_team": "Home",
+                    "away_team": "Away",
+                    "raw": {},
+                }
+            ]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("kalshi_mlb_research.cli.MLBClient", FakeMLBClient)
+
+    result = CliRunner().invoke(app, ["build-historical-replay-dataset", "--date", utc_now().date().isoformat()])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "INSUFFICIENT_BACKTEST_DATA"
+    assert payload["historical_games_count"] == 0
+    assert "no final games for date" in payload["blocking_reasons"]
+
+
+def test_model_only_backtest_with_final_states(monkeypatch, tmp_path) -> None:
+    _db_path, reports_dir = _configure_tmp(monkeypatch, tmp_path)
+    target_date = utc_now().date()
+    store = DuckDBStore()
+    base_state = MLBStateParser().parse(sample_mlb_live_payload("123"))
+    final_state = replace(
+        base_state,
+        observed_at_utc=base_state.observed_at_utc + timedelta(minutes=5),
+        status="Final",
+        home_score=5,
+        away_score=3,
+    )
+    _store_mlb_state(store, base_state, target_date)
+    _store_mlb_state(store, final_state, target_date)
+    store.close()
+
+    result = CliRunner().invoke(app, ["backtest-model-only", "--date", target_date.isoformat()])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "COMPLETED"
+    assert payload["sample_count"] == 2
+    assert (reports_dir / target_date.isoformat() / "model_only_predictions.csv").exists()
 
 
 def test_record_odds_missing_key_is_blocker(monkeypatch, tmp_path) -> None:
