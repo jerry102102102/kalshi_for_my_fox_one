@@ -160,11 +160,26 @@ uv run --no-editable ksr report-market-replay-readiness --date <YYYY-MM-DD>
 
 Model-only backtest uses final game result as the label. Market replay still requires manual mapping plus overlapping Kalshi historical orderbook/trade data.
 
+For season-to-date validation, build the MLB research database first, then run model and market feasibility reports:
+
+```bash
+uv run --no-editable ksr build-mlb-season-database --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr backtest-model-only --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr build-kalshi-historical-database --start-date 2026-03-01 --end-date 2026-07-07 --keywords baseball,MLB,Yankees,Rays,Cubs,Orioles,Dodgers,Mets,Astros,Giants,Phillies,Reds,Nationals,"Blue Jays"
+uv run --no-editable ksr report-season-market-mapping --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr report-trading-backtest-feasibility --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr backtest-trading-candle-level --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr report-season-validation-summary
+```
+
+Season reports are written under `data/reports/season_to_date/`. Candle-level replay is a proxy only; full orderbook replay requires live-recorded orderbook snapshots over the game windows.
+
 ## 10. Known Limitations
 
 - Kalshi WebSocket delta reconstruction is conservative: raw WS messages are stored, and normalized snapshots are refreshed through REST after WS updates.
 - The MLB win probability model is a hand-built baseline, not trained/calibrated on historical MLB data.
 - Edge and paper trading reports require real mapping plus overlapping MLB/Kalshi timestamps.
+- Kalshi historical markets/candles/trades can support market availability checks, but historical full orderbook replay is not available unless orderbook snapshots were recorded live.
 - No true live trading executor is implemented; the guard intentionally rejects live orders.
 - If there is no live MLB game or no open Kalshi MLB market, latency/edge reports will be empty with blocking reasons.
 

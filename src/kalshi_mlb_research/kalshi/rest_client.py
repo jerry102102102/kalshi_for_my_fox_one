@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -26,7 +27,18 @@ class KalshiRestClient:
 
     def _get(self, path: str, params: dict[str, Any] | None = None, authenticated: bool = False) -> dict:
         headers = self._auth_headers("GET", path) if authenticated else None
-        response = self._client.get(path, params=params, headers=headers)
+        response = None
+        for attempt in range(4):
+            response = self._client.get(path, params=params, headers=headers)
+            if response.status_code != 429 or attempt == 3:
+                break
+            retry_after = response.headers.get("retry-after")
+            try:
+                delay = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+            except ValueError:
+                delay = 1.5 * (attempt + 1)
+            time.sleep(min(delay, 10.0))
+        assert response is not None
         if response.status_code >= 400:
             raise ExternalServiceError(f"Kalshi GET {path} failed: {response.status_code} {response.text}")
         return response.json()
@@ -63,6 +75,34 @@ class KalshiRestClient:
             ]
         return markets
 
+    def list_markets_page(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 1000,
+        query: str | None = None,
+        status: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if query:
+            params["search"] = query
+        if status:
+            params["status"] = status
+        return self._get("/markets", params=params)
+
+    def list_historical_markets_page(
+        self,
+        *,
+        cursor: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return self._get("/historical/markets", params=params)
+
     def get_market(self, ticker: str) -> dict:
         data = self._get(f"/markets/{ticker}")
         return data.get("market", data)
@@ -70,9 +110,53 @@ class KalshiRestClient:
     def get_orderbook(self, ticker: str, depth: int = 0) -> dict:
         return self._get(f"/markets/{ticker}/orderbook", params={"depth": depth})
 
+    def get_market_candlesticks(
+        self,
+        series_ticker: str,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 1,
+    ) -> dict:
+        return self._get(
+            f"/series/{series_ticker}/markets/{ticker}/candlesticks",
+            params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+        )
+
+    def get_historical_market_candlesticks(
+        self,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 1,
+    ) -> dict:
+        return self._get(
+            f"/historical/markets/{ticker}/candlesticks",
+            params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+        )
+
     def get_trades(self, ticker: str, limit: int = 100) -> list[dict]:
         data = self._get("/markets/trades", params={"ticker": ticker, "limit": limit})
         return data.get("trades", [])
+
+    def get_trades_page(
+        self,
+        ticker: str,
+        *,
+        cursor: str | None = None,
+        limit: int = 1000,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
+        historical: bool = False,
+    ) -> dict:
+        params: dict[str, Any] = {"ticker": ticker, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if max_ts is not None:
+            params["max_ts"] = max_ts
+        return self._get("/historical/trades" if historical else "/markets/trades", params=params)
 
     def get_balance(self) -> dict:
         return self._get("/portfolio/balance", authenticated=True)

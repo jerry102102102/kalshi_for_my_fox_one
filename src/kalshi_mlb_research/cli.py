@@ -17,6 +17,7 @@ import typer
 from kalshi_mlb_research.config import load_settings
 from kalshi_mlb_research.exceptions import ExternalServiceError
 from kalshi_mlb_research.execution.edge import evaluate_yes_edge
+from kalshi_mlb_research.execution.fee_model import fee_per_contract
 from kalshi_mlb_research.execution.paper_broker import PaperBroker
 from kalshi_mlb_research.execution.risk_manager import RiskManager
 from kalshi_mlb_research.kalshi.auth import KalshiAuthError
@@ -28,7 +29,7 @@ from kalshi_mlb_research.mlb.client import MLBClient
 from kalshi_mlb_research.mlb.event_normalizer import SportsEventNormalizer
 from kalshi_mlb_research.mlb.schemas import MLBGameState
 from kalshi_mlb_research.mlb.state_parser import MLBStateParser
-from kalshi_mlb_research.mlb.team_mapping import team_similarity
+from kalshi_mlb_research.mlb.team_mapping import normalize_team_name, team_similarity
 from kalshi_mlb_research.models.baseline_mlb_wp import MLBWinProbabilityModel
 from kalshi_mlb_research.odds.client import OddsClient
 from kalshi_mlb_research.odds.prior import build_pregame_prior
@@ -206,20 +207,50 @@ def _store_mlb_state(store: DuckDBStore, state: MLBGameState, target_date: Date)
     )
 
 
+def _compact_state_payload(state: MLBGameState | None) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return {
+        "game_pk": state.game_pk,
+        "observed_at_utc": state.observed_at_utc.isoformat(),
+        "status": state.status,
+        "inning": state.inning,
+        "half_inning": state.half_inning,
+        "outs": state.outs,
+        "balls": state.balls,
+        "strikes": state.strikes,
+        "runner_on_first": state.runner_on_first,
+        "runner_on_second": state.runner_on_second,
+        "runner_on_third": state.runner_on_third,
+        "home_score": state.home_score,
+        "away_score": state.away_score,
+        "batter_id": state.batter_id,
+        "pitcher_id": state.pitcher_id,
+        "last_play_type": state.last_play_type,
+    }
+
+
 def _store_sports_event(store: DuckDBStore, event: object) -> None:
     before = getattr(event, "before_state")
     after = getattr(event, "after_state")
+    observed_at = getattr(event, "observed_at_utc")
+    event_type = getattr(event, "event_type")
+    game_pk = getattr(event, "game_pk")
     store.append_json(
         "sports_events",
         {
-            "observed_at_utc": getattr(event, "observed_at_utc"),
-            "game_pk": getattr(event, "game_pk"),
+            "observed_at_utc": observed_at,
+            "game_pk": game_pk,
             "source_event_time_utc": getattr(event, "source_event_time_utc"),
-            "event_type": getattr(event, "event_type"),
-            "before_state": before,
-            "after_state": after,
+            "event_type": event_type,
+            "before_state": _compact_state_payload(before),
+            "after_state": _compact_state_payload(after),
             "raw_payload": getattr(event, "raw_payload"),
-            "event": event,
+            "event": {
+                "game_pk": game_pk,
+                "observed_at_utc": observed_at.isoformat() if hasattr(observed_at, "isoformat") else str(observed_at),
+                "event_type": event_type,
+            },
         },
     )
 
@@ -701,6 +732,75 @@ def _report_paths(target_date: Date, stem: str) -> tuple[Any, Any]:
     return directory / f"{stem}.md", directory / f"{stem}.csv"
 
 
+def _season_report_dir() -> Any:
+    path = load_settings().reports_dir / "season_to_date"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _iter_dates(start_date: Date, end_date: Date) -> list[Date]:
+    if end_date < start_date:
+        raise typer.BadParameter("end date must be on or after start date")
+    return [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
+
+
+def _date_range(start_date: str | None, end_date: str | None, date: str | None = None) -> tuple[Date, Date, bool]:
+    if date:
+        target = parse_date_arg(date)
+        return target, target, False
+    if not start_date and not end_date:
+        target = parse_date_arg("today")
+        return target, target, False
+    if not start_date or not end_date:
+        raise typer.BadParameter("start-date and end-date must be provided together")
+    return parse_date_arg(start_date), parse_date_arg(end_date), True
+
+
+def _range_report_paths(start_date: Date, end_date: Date, is_range: bool, stem: str) -> tuple[Any, Any]:
+    if is_range:
+        directory = _season_report_dir()
+    else:
+        directory = report_dir(load_settings().reports_dir, start_date)
+    return directory / f"{stem}.md", directory / f"{stem}.csv"
+
+
+def _timestamp(value: Date, end_of_day: bool = False) -> int:
+    hour, minute, second = (23, 59, 59) if end_of_day else (0, 0, 0)
+    return int(datetime(value.year, value.month, value.day, hour, minute, second, tzinfo=timezone.utc).timestamp())
+
+
+def _default_season_dates() -> tuple[Date, Date]:
+    return Date(2026, 3, 1), utc_now().date() - timedelta(days=1)
+
+
+def _parse_market_date(market: dict) -> Date | None:
+    for key in ("close_time", "latest_expiration_time", "expiration_time", "open_time", "created_time"):
+        parsed = parse_iso_datetime(market.get(key))
+        if parsed:
+            return parsed.date()
+    return None
+
+
+def _num(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("close")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _candle_price(candle: dict, side: str) -> float | None:
+    keys = ("yes_bid", "bid") if side == "bid" else ("yes_ask", "ask")
+    for key in keys:
+        value = _num(candle.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 @app.command("record-odds")
 def record_odds(sport: str = "mlb", date: str = "today") -> None:
     sport_key = "baseball_mlb" if sport.lower() in {"mlb", "baseball"} else sport
@@ -1048,6 +1148,45 @@ def _person_id_from_play(value: dict | None) -> str | None:
     return str(raw) if raw is not None else None
 
 
+def _compact_play_payload(play: dict, index: int, final_score: tuple[int, int]) -> dict[str, Any]:
+    about = play.get("about", {}) or {}
+    result = play.get("result", {}) or {}
+    count = play.get("count", {}) or {}
+    matchup = play.get("matchup", {}) or {}
+    runners = []
+    for runner in play.get("runners", []) or []:
+        movement = runner.get("movement", {}) or {}
+        runners.append(
+            {
+                "start": movement.get("start"),
+                "end": movement.get("end"),
+                "is_out": movement.get("isOut"),
+            }
+        )
+    final_home, final_away = final_score
+    return {
+        "play_index": index,
+        "inning": about.get("inning"),
+        "half_inning": about.get("halfInning"),
+        "start_time": about.get("startTime"),
+        "end_time": about.get("endTime"),
+        "event": result.get("event"),
+        "event_type": result.get("eventType"),
+        "description": result.get("description"),
+        "home_score": result.get("homeScore"),
+        "away_score": result.get("awayScore"),
+        "balls": count.get("balls"),
+        "strikes": count.get("strikes"),
+        "outs": count.get("outs"),
+        "batter_id": _person_id_from_play(matchup.get("batter")),
+        "pitcher_id": _person_id_from_play(matchup.get("pitcher")),
+        "runners": runners,
+        "home_final_score": final_home,
+        "away_final_score": final_away,
+        "home_win_label": 1 if final_home > final_away else 0,
+    }
+
+
 def _historical_state_from_play(
     payload: dict,
     play: dict,
@@ -1055,6 +1194,7 @@ def _historical_state_from_play(
     play_count: int,
     target_date: Date,
     previous_score: tuple[int, int],
+    final_score: tuple[int, int] | None = None,
 ) -> MLBGameState:
     game_data = payload.get("gameData", {}) or {}
     teams = game_data.get("teams", {}) or {}
@@ -1071,6 +1211,7 @@ def _historical_state_from_play(
     first, second, third = _runner_bases_after_play(play)
     home_score = int(result["homeScore"]) if result.get("homeScore") is not None else previous_score[0]
     away_score = int(result["awayScore"]) if result.get("awayScore") is not None else previous_score[1]
+    final_home, final_away = final_score or (home_score, away_score)
     return MLBGameState(
         game_pk=str(payload.get("gamePk") or game_data.get("game", {}).get("pk") or ""),
         observed_at_utc=observed,
@@ -1092,8 +1233,64 @@ def _historical_state_from_play(
         pitcher_id=_person_id_from_play(matchup.get("pitcher")),
         last_play_type=result.get("eventType") or result.get("event"),
         last_play_description=result.get("description"),
-        raw_payload={"play_index": index, "play": play},
+        raw_payload=_compact_play_payload(play, index, (final_home, final_away)),
     )
+
+
+def _store_historical_state_and_play(store: DuckDBStore, state: MLBGameState, target_date: Date) -> None:
+    raw = state.raw_payload or {}
+    play_payload = dict(raw)
+    play_index = int(raw.get("play_index") or 0)
+    event_type = state.last_play_type
+    description = state.last_play_description
+    home_final_score = raw.get("home_final_score")
+    away_final_score = raw.get("away_final_score")
+    home_win_label = raw.get("home_win_label")
+    row = {
+        "observed_at_utc": state.observed_at_utc,
+        "game_pk": state.game_pk,
+        "game_date": target_date.isoformat(),
+        "play_index": play_index,
+        "home_team": state.home_team,
+        "away_team": state.away_team,
+        "status": state.status,
+        "inning": state.inning,
+        "half_inning": state.half_inning,
+        "outs": state.outs,
+        "balls": state.balls,
+        "strikes": state.strikes,
+        "runner_on_first": state.runner_on_first,
+        "runner_on_second": state.runner_on_second,
+        "runner_on_third": state.runner_on_third,
+        "home_score": state.home_score,
+        "away_score": state.away_score,
+        "batter_id": state.batter_id,
+        "pitcher_id": state.pitcher_id,
+        "last_play_type": state.last_play_type,
+        "last_play_description": state.last_play_description,
+        "event_type": event_type,
+        "description": description,
+        "home_final_score": home_final_score,
+        "away_final_score": away_final_score,
+        "home_win_label": home_win_label,
+        "raw_payload": play_payload,
+        "state": state,
+    }
+    store.append_json("mlb_game_states", row)
+    store.append_json("mlb_plays", row)
+
+
+def _final_score_from_payload(payload: dict, plays: list[dict]) -> tuple[int, int]:
+    linescore = payload.get("liveData", {}).get("linescore", {}).get("teams", {}) or {}
+    home = linescore.get("home", {}).get("runs")
+    away = linescore.get("away", {}).get("runs")
+    if home is not None and away is not None:
+        return int(home), int(away)
+    for play in reversed(plays):
+        result = play.get("result", {}) or {}
+        if result.get("homeScore") is not None and result.get("awayScore") is not None:
+            return int(result["homeScore"]), int(result["awayScore"])
+    return 0, 0
 
 
 @app.command("build-historical-replay-dataset")
@@ -1120,15 +1317,17 @@ def build_historical_replay_dataset(date: Annotated[str, typer.Option("--date")]
             if not plays:
                 blockers.append(f"{game_pk}: no play-by-play events")
                 continue
+            final_score = _final_score_from_payload(payload, plays)
             store.conn.execute("DELETE FROM sports_events WHERE game_pk=?", [game_pk])
             store.conn.execute("DELETE FROM mlb_game_states WHERE game_pk=? AND game_date=?", [game_pk, target_date.isoformat()])
+            store.conn.execute("DELETE FROM mlb_plays WHERE game_pk=? AND game_date=?", [game_pk, target_date.isoformat()])
             games_count += 1
             previous: MLBGameState | None = None
             score = (0, 0)
             for index, play in enumerate(plays):
-                state = _historical_state_from_play(payload, play, index, len(plays), target_date, score)
+                state = _historical_state_from_play(payload, play, index, len(plays), target_date, score, final_score)
                 score = (state.home_score, state.away_score)
-                _store_mlb_state(store, state, target_date)
+                _store_historical_state_and_play(store, state, target_date)
                 _store_sports_event(store, normalizer.normalize(previous, state))
                 previous = state
                 states_count += 1
@@ -1157,12 +1356,144 @@ def build_historical_replay_dataset(date: Annotated[str, typer.Option("--date")]
     )
 
 
-def _model_only_backtest(target_date: Date) -> dict[str, Any]:
+def _store_final_game_metadata(
+    store: DuckDBStore,
+    target_date: Date,
+    game: dict,
+    payload: dict,
+    final_score: tuple[int, int],
+) -> None:
+    home_final_score, away_final_score = final_score
+    home_win_label = 1 if home_final_score > away_final_score else 0
+    row = {
+        "game_date": target_date.isoformat(),
+        "game_pk": str(game.get("game_pk")),
+        "game_time_utc": game.get("game_date"),
+        "home_team": game.get("home_team"),
+        "away_team": game.get("away_team"),
+        "status": game.get("status"),
+        "home_final_score": home_final_score,
+        "away_final_score": away_final_score,
+        "home_win_label": home_win_label,
+        "raw_payload": payload,
+    }
+    store.append_json("mlb_games", row)
+    store.append_json("mlb_final_results", row)
+
+
+@app.command("build-mlb-season-database")
+def build_mlb_season_database(
+    start_date: Annotated[str, typer.Option("--start-date")],
+    end_date: Annotated[str, typer.Option("--end-date")],
+) -> None:
+    start, end, _is_range = _date_range(start_date, end_date)
+    store = DuckDBStore()
+    client = MLBClient()
+    normalizer = SportsEventNormalizer()
+    final_games_count = 0
+    plays_count = 0
+    states_count = 0
+    failed_games: list[dict[str, Any]] = []
+    dates = _iter_dates(start, end)
+    try:
+        for day in dates:
+            try:
+                games = client.schedule(day)
+            except Exception as exc:
+                failed_games.append({"date": day.isoformat(), "game_pk": None, "reason": str(exc)})
+                continue
+            store.conn.execute("DELETE FROM mlb_schedule WHERE game_date=?", [day.isoformat()])
+            _store_mlb_schedule(store, day, games)
+            for game in [item for item in games if _final_game(str(item.get("status")))]:
+                game_pk = str(game.get("game_pk"))
+                try:
+                    payload = client.live_game(game_pk)
+                    plays = payload.get("liveData", {}).get("plays", {}).get("allPlays", []) or []
+                    if not plays:
+                        raise ValueError("no play-by-play events")
+                    final_score = _final_score_from_payload(payload, plays)
+                    store.conn.execute("DELETE FROM sports_events WHERE game_pk=?", [game_pk])
+                    store.conn.execute("DELETE FROM mlb_game_states WHERE game_pk=? AND game_date=?", [game_pk, day.isoformat()])
+                    store.conn.execute("DELETE FROM mlb_plays WHERE game_pk=? AND game_date=?", [game_pk, day.isoformat()])
+                    store.conn.execute("DELETE FROM mlb_games WHERE game_pk=? AND game_date=?", [game_pk, day.isoformat()])
+                    store.conn.execute("DELETE FROM mlb_final_results WHERE game_pk=? AND game_date=?", [game_pk, day.isoformat()])
+                    _store_final_game_metadata(store, day, game, payload.get("gameData", {}), final_score)
+                    final_games_count += 1
+                    previous: MLBGameState | None = None
+                    score = (0, 0)
+                    for index, play in enumerate(plays):
+                        state = _historical_state_from_play(payload, play, index, len(plays), day, score, final_score)
+                        score = (state.home_score, state.away_score)
+                        _store_historical_state_and_play(store, state, day)
+                        _store_sports_event(store, normalizer.normalize(previous, state))
+                        previous = state
+                        plays_count += 1
+                        states_count += 1
+                except Exception as exc:
+                    failed_games.append({"date": day.isoformat(), "game_pk": game_pk, "reason": str(exc)})
+    finally:
+        client.close()
+        store.close()
+    _echo_json(
+        {
+            "status": "COMPLETED" if final_games_count else "INSUFFICIENT_BACKTEST_DATA",
+            "final_games_count": final_games_count,
+            "plays_count": plays_count,
+            "states_count": states_count,
+            "date_range": {"start_date": start, "end_date": end},
+            "failed_games": failed_games,
+        }
+    )
+
+
+def _brier(rows: list[dict[str, Any]], key: str = "home_win_p") -> float:
+    if not rows:
+        return 0.0
+    return sum((float(row[key]) - int(row["home_win_label"])) ** 2 for row in rows) / len(rows)
+
+
+def _group_brier(rows: list[dict[str, Any]], group_key: str) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(str(row[group_key]), []).append(row)
+    return [
+        {"bucket": key, "sample_count": len(bucket), "brier_score": round(_brier(bucket), 6)}
+        for key, bucket in sorted(groups.items())
+    ]
+
+
+def _score_diff_bucket(score_diff: int) -> str:
+    if score_diff <= -3:
+        return "home_trails_3plus"
+    if score_diff == -2:
+        return "home_trails_2"
+    if score_diff == -1:
+        return "home_trails_1"
+    if score_diff == 0:
+        return "tie"
+    if score_diff == 1:
+        return "home_leads_1"
+    if score_diff == 2:
+        return "home_leads_2"
+    return "home_leads_3plus"
+
+
+def _score_diff_only_probability(score_diff: int) -> float:
+    return 1.0 / (1.0 + math.exp(-(0.35 * score_diff)))
+
+
+def _model_only_backtest_range(start_date: Date, end_date: Date) -> dict[str, Any]:
     store = DuckDBStore()
     try:
         state_rows = store.fetch_all(
-            "SELECT * FROM mlb_game_states WHERE game_date=? ORDER BY game_pk, observed_at_utc",
-            [target_date.isoformat()],
+            """
+            SELECT s.*, f.home_win_label AS final_label
+            FROM mlb_game_states s
+            LEFT JOIN mlb_final_results f ON f.game_pk=s.game_pk AND f.game_date=s.game_date
+            WHERE s.game_date BETWEEN ? AND ?
+            ORDER BY s.game_pk, s.observed_at_utc
+            """,
+            [start_date.isoformat(), end_date.isoformat()],
         )
     finally:
         store.close()
@@ -1170,23 +1501,31 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
     if not state_rows:
         return {
             "status": "INSUFFICIENT_BACKTEST_DATA",
-            "blocking_reasons": ["no MLB states for date"],
+            "blocking_reasons": ["no MLB states for date range"],
             "predictions": [],
             "metrics": [],
             "calibration_bins": [],
         }
 
     states_by_game: dict[str, list[MLBGameState]] = {}
+    row_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     for row in state_rows:
         state = _state_from_stored_json(row["state"])
         states_by_game.setdefault(state.game_pk, []).append(state)
+        row_by_key[(state.game_pk, state.observed_at_utc.isoformat())] = row
 
     labels: dict[str, int] = {}
     for game_pk, states in states_by_game.items():
         final_state = states[-1]
-        if final_state.home_score == final_state.away_score:
-            continue
-        labels[game_pk] = 1 if final_state.home_score > final_state.away_score else 0
+        stored_row = row_by_key.get((final_state.game_pk, final_state.observed_at_utc.isoformat()), {})
+        label = stored_row.get("home_win_label")
+        if label is None:
+            label = stored_row.get("final_label")
+        if label is None:
+            if final_state.home_score == final_state.away_score:
+                continue
+            label = 1 if final_state.home_score > final_state.away_score else 0
+        labels[game_pk] = int(label)
 
     if not labels:
         return {
@@ -1206,17 +1545,26 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
         for state in states:
             prediction = model.predict(state)
             probability = prediction.home_win_p_mid
+            score_diff = state.home_score - state.away_score
+            score_diff_p = _score_diff_only_probability(score_diff)
             predictions.append(
                 {
                     "observed_at_utc": state.observed_at_utc.isoformat(),
                     "game_pk": game_pk,
+                    "game_date": row_by_key.get((state.game_pk, state.observed_at_utc.isoformat()), {}).get("game_date"),
                     "home_team": state.home_team,
                     "away_team": state.away_team,
                     "inning": state.inning,
                     "half_inning": state.half_inning,
                     "home_score": state.home_score,
                     "away_score": state.away_score,
+                    "score_diff": score_diff,
+                    "score_diff_bucket": _score_diff_bucket(score_diff),
+                    "base_out_state": f"{int(state.runner_on_first)}{int(state.runner_on_second)}{int(state.runner_on_third)}_{state.outs}",
+                    "event_type": state.last_play_type,
                     "home_win_p": probability,
+                    "score_diff_only_p": score_diff_p,
+                    "always_0_5_p": 0.5,
                     "home_win_label": label,
                     "predicted_home_win": probability >= 0.5,
                     "correct": (probability >= 0.5) == bool(label),
@@ -1233,7 +1581,8 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
         }
 
     sample_count = len(predictions)
-    brier = sum((float(row["home_win_p"]) - int(row["home_win_label"])) ** 2 for row in predictions) / sample_count
+    game_count = len(labels)
+    brier = _brier(predictions)
     log_loss = 0.0
     for row in predictions:
         p = min(0.999999, max(0.000001, float(row["home_win_p"])))
@@ -1241,25 +1590,36 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
         log_loss += -(y * math.log(p) + (1 - y) * math.log(1 - p))
     log_loss /= sample_count
     accuracy = sum(1 for row in predictions if row["correct"]) / sample_count
+    mean_pred = sum(float(row["home_win_p"]) for row in predictions) / sample_count
+    actual_home_win_rate = sum(int(row["home_win_label"]) for row in predictions) / sample_count
 
     bins: list[dict[str, Any]] = []
     distribution: dict[str, int] = {}
-    for bin_index in range(5):
-        low = bin_index / 5
-        high = (bin_index + 1) / 5
+    ece = 0.0
+    max_calibration_error = 0.0
+    for bin_index in range(10):
+        low = bin_index / 10
+        high = (bin_index + 1) / 10
         label = f"{low:.1f}-{high:.1f}"
         bucket = [
             row
             for row in predictions
-            if bin_index == min(int(float(row["home_win_p"]) * 5), 4)
+            if bin_index == min(int(float(row["home_win_p"]) * 10), 9)
         ]
         distribution[label] = len(bucket)
+        avg_prediction = (sum(float(row["home_win_p"]) for row in bucket) / len(bucket)) if bucket else None
+        actual_rate = (sum(int(row["home_win_label"]) for row in bucket) / len(bucket)) if bucket else None
+        calibration_error = abs(avg_prediction - actual_rate) if avg_prediction is not None and actual_rate is not None else None
+        if calibration_error is not None:
+            ece += (len(bucket) / sample_count) * calibration_error
+            max_calibration_error = max(max_calibration_error, calibration_error)
         bins.append(
             {
                 "bin": label,
                 "sample_count": len(bucket),
-                "avg_prediction": (sum(float(row["home_win_p"]) for row in bucket) / len(bucket)) if bucket else None,
-                "actual_home_win_rate": (sum(int(row["home_win_label"]) for row in bucket) / len(bucket)) if bucket else None,
+                "avg_prediction": avg_prediction,
+                "actual_home_win_rate": actual_rate,
+                "calibration_error": calibration_error,
             }
         )
 
@@ -1273,17 +1633,31 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
             or (float(row["home_win_p"]) <= 0.1 and row["home_win_label"])
         ),
     }
+    always_brier = _brier(predictions, "always_0_5_p")
+    score_diff_brier = _brier(predictions, "score_diff_only_p")
+    model_flag = "MODEL_BASELINE_FAIL" if brier >= always_brier else "MODEL_BASELINE_PASS"
     metrics = [
+        {"metric": "model_status", "value": model_flag},
         {"metric": "sample_count", "value": sample_count},
+        {"metric": "game_count", "value": game_count},
         {"metric": "brier_score", "value": round(brier, 6)},
         {"metric": "log_loss", "value": round(log_loss, 6)},
-        {"metric": "calibration_bins", "value": bins},
-        {"metric": "home_win_p_distribution", "value": distribution},
-        {"metric": "final_result_accuracy", "value": round(accuracy, 6)},
+        {"metric": "accuracy_at_0_5", "value": round(accuracy, 6)},
+        {"metric": "mean_predicted_home_win_probability", "value": round(mean_pred, 6)},
+        {"metric": "actual_home_win_rate", "value": round(actual_home_win_rate, 6)},
+        {"metric": "expected_calibration_error", "value": round(ece, 6)},
+        {"metric": "max_calibration_error", "value": round(max_calibration_error, 6)},
+        {"metric": "calibration_by_bucket", "value": bins},
+        {"metric": "brier_by_inning", "value": _group_brier(predictions, "inning")},
+        {"metric": "brier_by_score_diff", "value": _group_brier(predictions, "score_diff_bucket")},
+        {"metric": "brier_by_base_out_state", "value": _group_brier(predictions, "base_out_state")},
+        {"metric": "always_0_5_brier", "value": round(always_brier, 6)},
+        {"metric": "score_diff_only_brier", "value": round(score_diff_brier, 6)},
+        {"metric": "pregame_prior_if_available_brier", "value": None},
         {"metric": "extreme_state_sanity_checks", "value": extreme},
     ]
     return {
-        "status": "COMPLETED",
+        "status": model_flag,
         "blocking_reasons": [],
         "predictions": predictions,
         "metrics": metrics,
@@ -1291,15 +1665,23 @@ def _model_only_backtest(target_date: Date) -> dict[str, Any]:
     }
 
 
+def _model_only_backtest(target_date: Date) -> dict[str, Any]:
+    return _model_only_backtest_range(target_date, target_date)
+
+
 @app.command("backtest-model-only")
-def backtest_model_only(date: Annotated[str, typer.Option("--date")]) -> None:
-    target_date = parse_date_arg(date)
-    result = _model_only_backtest(target_date)
-    directory = report_dir(load_settings().reports_dir, target_date)
+def backtest_model_only(
+    date: Annotated[Optional[str], typer.Option("--date")] = None,
+    start_date: Annotated[Optional[str], typer.Option("--start-date")] = None,
+    end_date: Annotated[Optional[str], typer.Option("--end-date")] = None,
+) -> None:
+    start, end, is_range = _date_range(start_date, end_date, date)
+    result = _model_only_backtest_range(start, end)
+    directory = _season_report_dir() if is_range else report_dir(load_settings().reports_dir, start)
     md_path = directory / "model_only_backtest.md"
     predictions_path = directory / "model_only_predictions.csv"
     bins_path = directory / "calibration_bins.csv"
-    if result["status"] == "COMPLETED":
+    if result["status"] in {"MODEL_BASELINE_PASS", "MODEL_BASELINE_FAIL"}:
         write_markdown_table(md_path, "Model Only Backtest", result["metrics"])
     else:
         write_markdown_table(
@@ -1314,6 +1696,7 @@ def backtest_model_only(date: Annotated[str, typer.Option("--date")]) -> None:
         {
             "status": result["status"],
             "blocking_reasons": result["blocking_reasons"],
+            "date_range": {"start_date": start, "end_date": end},
             "sample_count": len(result["predictions"]),
             "markdown": str(md_path),
             "predictions_csv": str(predictions_path),
@@ -1435,6 +1818,575 @@ def report_market_replay_readiness(date: Annotated[str, typer.Option("--date")])
             "csv": str(csv_path),
         }
     )
+
+
+def _market_text(market: dict) -> str:
+    fields = [
+        market.get("ticker"),
+        market.get("title"),
+        market.get("event_title"),
+        market.get("category"),
+        market.get("series_ticker"),
+    ]
+    return " ".join(str(field or "") for field in fields).lower()
+
+
+def _keyword_matched_market(market: dict, keywords: list[str]) -> bool:
+    text = _market_text(market)
+    return any(keyword.lower() in text for keyword in keywords)
+
+
+def _store_kalshi_market(store: DuckDBStore, market: dict, source: str) -> None:
+    ticker = str(market.get("ticker") or "")
+    if not ticker:
+        return
+    market_date = _parse_market_date(market)
+    store.append_json(
+        "kalshi_markets",
+        {
+            "ticker": ticker,
+            "title": market.get("title"),
+            "event_title": market.get("event_title"),
+            "series_ticker": market.get("series_ticker"),
+            "category": market.get("category"),
+            "status": market.get("status"),
+            "market_date": market_date.isoformat() if market_date else None,
+            "open_time": market.get("open_time"),
+            "close_time": market.get("close_time") or market.get("latest_expiration_time"),
+            "source": source,
+            "raw_payload": market,
+        },
+    )
+
+
+def _store_kalshi_candles(store: DuckDBStore, ticker: str, candles: list[dict], source: str) -> int:
+    count = 0
+    for candle in candles:
+        ts = candle.get("end_period_ts") or candle.get("period_end_ts") or candle.get("ts")
+        try:
+            observed = datetime.fromtimestamp(int(ts), timezone.utc) if ts is not None else utc_now()
+        except (TypeError, ValueError):
+            observed = utc_now()
+        store.append_json(
+            "kalshi_market_candles",
+            {
+                "observed_at_utc": observed,
+                "ticker": ticker,
+                "end_period_ts": int(ts) if ts is not None else None,
+                "period_interval": 1,
+                "yes_bid_close": _candle_price(candle, "bid"),
+                "yes_ask_close": _candle_price(candle, "ask"),
+                "source": source,
+                "raw_payload": candle,
+            },
+        )
+        count += 1
+    return count
+
+
+def _trade_price(trade: dict) -> float | None:
+    for key in ("yes_price_dollars", "yes_price", "price_dollars", "price"):
+        value = _num(trade.get(key))
+        if value is not None:
+            return value / 100 if value > 1 else value
+    return None
+
+
+def _store_kalshi_trades(store: DuckDBStore, trades: list[dict], source: str) -> int:
+    count = 0
+    for trade in trades:
+        observed = parse_iso_datetime(trade.get("created_time") or trade.get("created_at")) or utc_now()
+        count_value = trade.get("count") or trade.get("count_fp") or trade.get("quantity")
+        try:
+            contracts = int(float(count_value)) if count_value is not None else None
+        except (TypeError, ValueError):
+            contracts = None
+        store.append_json(
+            "kalshi_trades",
+            {
+                "observed_at_utc": observed,
+                "trade_id": trade.get("trade_id") or trade.get("id"),
+                "ticker": trade.get("ticker") or trade.get("market_ticker"),
+                "yes_price": _trade_price(trade),
+                "count": contracts,
+                "source": source,
+                "raw_payload": trade,
+            },
+        )
+        count += 1
+    return count
+
+
+def _fetch_kalshi_market_pages(
+    client: KalshiRestClient,
+    keywords: list[str],
+    start_date: Date,
+    end_date: Date,
+) -> tuple[dict[str, dict], list[dict[str, Any]]]:
+    markets: dict[str, dict] = {}
+    failures: list[dict[str, Any]] = []
+    max_live_pages_per_keyword = 3
+    for keyword in keywords:
+        cursor = None
+        live_pages = 0
+        while True:
+            try:
+                page = client.list_markets_page(cursor=cursor, query=keyword)
+            except Exception as exc:
+                failures.append({"source": "live", "keyword": keyword, "reason": str(exc)})
+                break
+            live_pages += 1
+            for market in page.get("markets", []) or []:
+                if _keyword_matched_market(market, keywords):
+                    market["_kalshi_source"] = "live"
+                    ticker = str(market.get("ticker") or "")
+                    if ticker:
+                        markets[ticker] = market
+            cursor = page.get("cursor")
+            time.sleep(0.2)
+            if not cursor:
+                break
+            if live_pages >= max_live_pages_per_keyword:
+                failures.append(
+                    {
+                        "source": "live",
+                        "keyword": keyword,
+                        "reason": f"live market scan capped at {max_live_pages_per_keyword} pages for broad keyword",
+                    }
+                )
+                break
+    cursor = None
+    historical_pages = 0
+    max_historical_pages = 5
+    while True:
+        try:
+            page = client.list_historical_markets_page(cursor=cursor)
+        except Exception as exc:
+            failures.append({"source": "historical", "keyword": ",".join(keywords), "reason": str(exc)})
+            break
+        historical_pages += 1
+        for market in page.get("markets", []) or []:
+            if _keyword_matched_market(market, keywords):
+                market["_kalshi_source"] = "historical"
+                ticker = str(market.get("ticker") or "")
+                if ticker:
+                    markets[ticker] = market
+        cursor = page.get("cursor")
+        time.sleep(0.2)
+        if not cursor:
+            break
+        if historical_pages >= max_historical_pages:
+            failures.append(
+                {
+                    "source": "historical",
+                    "keyword": ",".join(keywords),
+                    "reason": (
+                        f"historical market scan capped at {max_historical_pages} pages; "
+                        "endpoint has cursor pagination but no keyword/date filter"
+                    ),
+                }
+            )
+            break
+    return markets, failures
+
+
+@app.command("build-kalshi-historical-database")
+def build_kalshi_historical_database(
+    start_date: Annotated[str, typer.Option("--start-date")],
+    end_date: Annotated[str, typer.Option("--end-date")],
+    keywords: Annotated[str, typer.Option("--keywords")],
+) -> None:
+    start, end, _is_range = _date_range(start_date, end_date)
+    keyword_list = [keyword.strip() for keyword in keywords.split(",") if keyword.strip()]
+    store = DuckDBStore()
+    client = KalshiRestClient()
+    candle_count = 0
+    trade_count = 0
+    market_data_candidate_count = 0
+    failed_market_data: list[dict[str, Any]] = []
+    try:
+        store.conn.execute("DELETE FROM kalshi_markets")
+        store.conn.execute("DELETE FROM kalshi_market_candles WHERE CAST(observed_at_utc AS DATE) BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        store.conn.execute("DELETE FROM kalshi_trades WHERE CAST(observed_at_utc AS DATE) BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        markets, search_failures = _fetch_kalshi_market_pages(client, keyword_list, start, end)
+        failed_market_data.extend(search_failures)
+        for market in markets.values():
+            _store_kalshi_market(store, market, str(market.get("_kalshi_source") or "live"))
+        stored_markets = store.fetch_all("SELECT * FROM kalshi_markets")
+        market_data_candidates = [
+            market
+            for market in stored_markets
+            if market.get("market_date") and start <= market["market_date"] <= end
+        ]
+        market_data_candidate_count = len(market_data_candidates)
+        for market in market_data_candidates:
+            ticker = market["ticker"]
+            series_ticker = market.get("series_ticker")
+            candles: list[dict] = []
+            source = "historical"
+            try:
+                candles = client.get_historical_market_candlesticks(ticker, _timestamp(start), _timestamp(end, True), 1).get("candlesticks", [])
+            except Exception as historical_exc:
+                try:
+                    if not series_ticker:
+                        raise historical_exc
+                    source = "live"
+                    candles = client.get_market_candlesticks(series_ticker, ticker, _timestamp(start), _timestamp(end, True), 1).get("candlesticks", [])
+                except Exception as live_exc:
+                    failed_market_data.append({"ticker": ticker, "data": "candlesticks", "reason": str(live_exc)})
+            candle_count += _store_kalshi_candles(store, ticker, candles, source)
+
+            for historical in (True, False):
+                cursor = None
+                while True:
+                    try:
+                        page = client.get_trades_page(
+                            ticker,
+                            cursor=cursor,
+                            min_ts=_timestamp(start),
+                            max_ts=_timestamp(end, True),
+                            historical=historical,
+                        )
+                    except Exception as exc:
+                        if historical:
+                            failed_market_data.append({"ticker": ticker, "data": "historical_trades", "reason": str(exc)})
+                        break
+                    trades = page.get("trades", []) or []
+                    trade_count += _store_kalshi_trades(store, trades, "historical" if historical else "live")
+                    cursor = page.get("cursor")
+                    if not cursor:
+                        break
+    finally:
+        client.close()
+        store.close()
+    _echo_json(
+        {
+            "status": "COMPLETED",
+            "candidate_market_count": len(markets) if "markets" in locals() else 0,
+            "stored_market_count": len(stored_markets) if "stored_markets" in locals() else 0,
+            "market_data_candidate_count": market_data_candidate_count,
+            "candle_count": candle_count,
+            "trade_count": trade_count,
+            "date_range": {"start_date": start, "end_date": end},
+            "failed_market_data": failed_market_data[:100],
+            "historical_full_orderbook_note": "Historical full orderbook replay is not available unless we recorded live orderbook snapshots ourselves.",
+        }
+    )
+
+
+def _market_game_match(market: dict, game: dict) -> tuple[float, str]:
+    text = _market_text(market)
+    home_alias = normalize_team_name(str(game.get("home_team") or ""))
+    away_alias = normalize_team_name(str(game.get("away_team") or ""))
+    home_hit = bool(home_alias and home_alias in text)
+    away_hit = bool(away_alias and away_alias in text)
+    if home_hit and away_hit:
+        return 0.95, "both team aliases found in market text"
+    if home_hit or away_hit:
+        return 0.55, "one team alias found in market text"
+    return max(team_similarity(home_alias, text), team_similarity(away_alias, text)), "fuzzy text similarity"
+
+
+@app.command("report-season-market-mapping")
+def report_season_market_mapping(
+    start_date: Annotated[str, typer.Option("--start-date")],
+    end_date: Annotated[str, typer.Option("--end-date")],
+) -> None:
+    start, end, _is_range = _date_range(start_date, end_date)
+    store = DuckDBStore()
+    rows: list[dict[str, Any]] = []
+    try:
+        markets = store.fetch_all("SELECT * FROM kalshi_markets")
+        games = store.fetch_all(
+            "SELECT * FROM mlb_games WHERE game_date BETWEEN ? AND ?",
+            [start.isoformat(), end.isoformat()],
+        )
+        store.conn.execute("DELETE FROM kalshi_market_game_candidates")
+        for market in markets:
+            market_date = market.get("market_date")
+            best_score = 0.0
+            best_game: dict[str, Any] | None = None
+            best_reason = "no candidate game"
+            for game in games:
+                if market_date and abs((market_date - game["game_date"]).days) > 1:
+                    continue
+                score, reason = _market_game_match(market, game)
+                if score > best_score:
+                    best_score = score
+                    best_game = game
+                    best_reason = reason
+            requires_review = best_score < 0.85
+            row = {
+                "ticker": market.get("ticker"),
+                "title": market.get("title"),
+                "event_title": market.get("event_title"),
+                "series_ticker": market.get("series_ticker"),
+                "market_date": market_date,
+                "candidate_game_pk": best_game.get("game_pk") if best_game and best_score >= 0.45 else None,
+                "home_team": best_game.get("home_team") if best_game and best_score >= 0.45 else None,
+                "away_team": best_game.get("away_team") if best_game and best_score >= 0.45 else None,
+                "match_score": round(best_score, 4),
+                "match_reason": best_reason if best_score >= 0.45 else "no confident team/date match",
+                "requires_manual_review": requires_review,
+            }
+            rows.append(row)
+            store.append_json("kalshi_market_game_candidates", {**row, "raw_payload": market})
+    finally:
+        store.close()
+    directory = _season_report_dir()
+    csv_path = directory / "market_mapping_candidates.csv"
+    md_path = directory / "market_mapping_report.md"
+    write_csv(csv_path, rows)
+    auto_match_count = sum(1 for row in rows if row["candidate_game_pk"] and not row["requires_manual_review"])
+    manual_review_count = sum(1 for row in rows if row["requires_manual_review"])
+    matched_game_count = len({row["candidate_game_pk"] for row in rows if row["candidate_game_pk"] and not row["requires_manual_review"]})
+    unmatched_market_count = sum(1 for row in rows if not row["candidate_game_pk"])
+    unmatched_game_count = max(0, len({game["game_pk"] for game in games}) - matched_game_count) if "games" in locals() else 0
+    summary_rows = [
+        {"metric": "candidate_market_count", "value": len(rows)},
+        {"metric": "auto_match_count", "value": auto_match_count},
+        {"metric": "manual_review_count", "value": manual_review_count},
+        {"metric": "matched_game_count", "value": matched_game_count},
+        {"metric": "unmatched_market_count", "value": unmatched_market_count},
+        {"metric": "unmatched_game_count", "value": unmatched_game_count},
+    ]
+    write_markdown_table(md_path, "Season Market Mapping Report", summary_rows)
+    _echo_json(
+        {
+            "candidate_market_count": len(rows),
+            "auto_match_count": auto_match_count,
+            "manual_review_count": manual_review_count,
+            "matched_game_count": matched_game_count,
+            "unmatched_market_count": unmatched_market_count,
+            "unmatched_game_count": unmatched_game_count,
+            "csv": str(csv_path),
+            "markdown": str(md_path),
+        }
+    )
+
+
+def _season_feasibility(start: Date, end: Date) -> dict[str, Any]:
+    store = DuckDBStore()
+    try:
+        mlb_state_count = _count(store, "SELECT COUNT(*) AS count FROM mlb_game_states WHERE game_date BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        final_label_count = _count(store, "SELECT COUNT(*) AS count FROM mlb_final_results WHERE game_date BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        matched_market_count = _count(store, "SELECT COUNT(DISTINCT ticker) AS count FROM kalshi_market_game_candidates WHERE candidate_game_pk IS NOT NULL AND requires_manual_review=false")
+        candle_count = _count(store, "SELECT COUNT(*) AS count FROM kalshi_market_candles WHERE CAST(observed_at_utc AS DATE) BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        full_orderbook_snapshot_count = _count(store, "SELECT COUNT(*) AS count FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE) BETWEEN ? AND ?", [start.isoformat(), end.isoformat()])
+        candidate_market_count = _count(store, "SELECT COUNT(*) AS count FROM kalshi_markets")
+        overlap_count = _count(
+            store,
+            """
+            SELECT COUNT(*) AS count
+            FROM kalshi_market_game_candidates c
+            JOIN mlb_game_states s ON s.game_pk=c.candidate_game_pk
+            JOIN kalshi_market_candles k ON k.ticker=c.ticker
+            WHERE c.requires_manual_review=false
+              AND s.game_date BETWEEN ? AND ?
+              AND ABS(EXTRACT(EPOCH FROM (k.observed_at_utc - s.observed_at_utc))) <= 120
+            """,
+            [start.isoformat(), end.isoformat()],
+        )
+    finally:
+        store.close()
+    model_only_ready = mlb_state_count > 0 and final_label_count > 0
+    candle_ready = matched_market_count > 0 and candle_count > 0 and overlap_count > 0
+    full_orderbook_ready = matched_market_count > 0 and full_orderbook_snapshot_count > 0
+    missing = []
+    if not model_only_ready:
+        missing.append("MLB states/final labels")
+    if matched_market_count == 0:
+        missing.append("mapped Kalshi MLB markets")
+    if candle_count == 0:
+        missing.append("candles")
+    if overlap_count == 0:
+        missing.append("market/game overlap")
+    if full_orderbook_snapshot_count == 0:
+        missing.append("live recorded orderbook snapshots over game window")
+    return {
+        "model_only_ready": model_only_ready,
+        "candle_market_replay_ready": candle_ready,
+        "full_orderbook_replay_ready": full_orderbook_ready,
+        "missing": missing,
+        "metrics": {
+            "mlb_state_count": mlb_state_count,
+            "final_label_count": final_label_count,
+            "candidate_market_count": candidate_market_count,
+            "matched_market_count": matched_market_count,
+            "candle_count": candle_count,
+            "market_game_overlap_count": overlap_count,
+            "full_orderbook_snapshot_count": full_orderbook_snapshot_count,
+        },
+    }
+
+
+@app.command("report-trading-backtest-feasibility")
+def report_trading_backtest_feasibility(
+    start_date: Annotated[str, typer.Option("--start-date")],
+    end_date: Annotated[str, typer.Option("--end-date")],
+) -> None:
+    start, end, _is_range = _date_range(start_date, end_date)
+    feasibility = _season_feasibility(start, end)
+    rows = [
+        {"question": "Can we do full orderbook replay?", "answer": "yes" if feasibility["full_orderbook_replay_ready"] else "no"},
+        {"question": "Can we do candle-level market replay?", "answer": "yes" if feasibility["candle_market_replay_ready"] else "no"},
+        {"question": "Can we do model-only backtest?", "answer": "yes" if feasibility["model_only_ready"] else "no"},
+        {"question": "What exact data is missing?", "answer": "; ".join(feasibility["missing"])},
+    ]
+    rows.extend({"question": key, "answer": value} for key, value in feasibility["metrics"].items())
+    directory = _season_report_dir()
+    md_path = directory / "trading_backtest_feasibility.md"
+    csv_path = directory / "trading_backtest_feasibility.csv"
+    write_markdown_table(md_path, "Trading Backtest Feasibility", rows)
+    write_csv(csv_path, rows)
+    _echo_json({**feasibility, "markdown": str(md_path), "csv": str(csv_path)})
+
+
+def _nearest_candle(candles: list[dict[str, Any]], observed_at: datetime) -> dict[str, Any] | None:
+    if not candles:
+        return None
+    return min(candles, key=lambda row: abs((ensure_utc(row["observed_at_utc"]) - observed_at).total_seconds()))
+
+
+def _drawdown(equity_curve: list[float]) -> float:
+    peak = 0.0
+    max_drawdown = 0.0
+    for value in equity_curve:
+        peak = max(peak, value)
+        max_drawdown = min(max_drawdown, value - peak)
+    return max_drawdown
+
+
+def _result_groups(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(str(row.get(key) or "UNKNOWN"), []).append(row)
+    return [
+        {
+            "bucket": bucket,
+            "trade_count": len(items),
+            "net_pnl": round(sum(float(item["pnl"]) for item in items), 6),
+            "win_rate": round(sum(1 for item in items if float(item["pnl"]) > 0) / len(items), 6) if items else 0,
+        }
+        for bucket, items in sorted(groups.items())
+    ]
+
+
+@app.command("backtest-trading-candle-level")
+def backtest_trading_candle_level(
+    start_date: Annotated[str, typer.Option("--start-date")],
+    end_date: Annotated[str, typer.Option("--end-date")],
+) -> None:
+    start, end, _is_range = _date_range(start_date, end_date)
+    feasibility = _season_feasibility(start, end)
+    directory = _season_report_dir()
+    md_path = directory / "candle_trading_backtest.md"
+    csv_path = directory / "candle_trades.csv"
+    if not feasibility["candle_market_replay_ready"]:
+        reasons = []
+        if feasibility["metrics"]["matched_market_count"] == 0:
+            reasons.append("no mapped Kalshi MLB markets")
+        if feasibility["metrics"]["candle_count"] == 0:
+            reasons.append("no candles")
+        if feasibility["metrics"]["market_game_overlap_count"] == 0:
+            reasons.append("no market/game overlap")
+        write_markdown_table(
+            md_path,
+            "Candle Trading Backtest",
+            [],
+            note="CANDLE_MARKET_REPLAY_NOT_AVAILABLE\nreason:\n" + "\n".join(f"- {reason}" for reason in reasons),
+        )
+        write_csv(csv_path, [])
+        _echo_json({"status": "CANDLE_MARKET_REPLAY_NOT_AVAILABLE", "reason": reasons, "markdown": str(md_path), "csv": str(csv_path)})
+        return
+
+    settings = load_settings()
+    store = DuckDBStore()
+    trades: list[dict[str, Any]] = []
+    run_id = str(uuid.uuid4())
+    try:
+        mappings = store.fetch_all("SELECT * FROM kalshi_market_game_candidates WHERE candidate_game_pk IS NOT NULL AND requires_manual_review=false")
+        model = MLBWinProbabilityModel()
+        for mapping in mappings:
+            states = store.fetch_all(
+                "SELECT * FROM mlb_game_states WHERE game_pk=? AND game_date BETWEEN ? AND ? ORDER BY observed_at_utc",
+                [mapping["candidate_game_pk"], start.isoformat(), end.isoformat()],
+            )
+            candles = store.fetch_all(
+                "SELECT * FROM kalshi_market_candles WHERE ticker=? ORDER BY observed_at_utc",
+                [mapping["ticker"]],
+            )
+            for row in states:
+                label = row.get("home_win_label")
+                if label is None:
+                    continue
+                candle = _nearest_candle(candles, ensure_utc(row["observed_at_utc"]))
+                if not candle or candle.get("yes_ask_close") is None or candle.get("yes_bid_close") is None:
+                    continue
+                state = _state_from_stored_json(row["state"])
+                model_prob = Decimal(str(model.predict(state).home_win_p_mid)).quantize(Decimal("0.0001"))
+                ask = Decimal(str(candle["yes_ask_close"])).quantize(Decimal("0.0001"))
+                bid = Decimal(str(candle["yes_bid_close"])).quantize(Decimal("0.0001"))
+                buy_fee = fee_per_contract(ask)
+                sell_fee = fee_per_contract(bid)
+                buy_edge = model_prob - ask - buy_fee - settings.slippage_buffer - settings.safety_margin
+                sell_edge = bid - model_prob - sell_fee - settings.slippage_buffer - settings.safety_margin
+                if buy_edge <= 0 and sell_edge <= 0:
+                    continue
+                if buy_edge >= sell_edge:
+                    side = "BUY_YES"
+                    price = ask
+                    fee = buy_fee
+                    edge = buy_edge
+                    gross = Decimal(str(label)) - price
+                else:
+                    side = "SELL_YES"
+                    price = bid
+                    fee = sell_fee
+                    edge = sell_edge
+                    gross = price - Decimal(str(label))
+                pnl = gross - fee - settings.slippage_buffer
+                trade = {
+                    "observed_at_utc": row["observed_at_utc"],
+                    "run_id": run_id,
+                    "game_pk": row["game_pk"],
+                    "ticker": mapping["ticker"],
+                    "side": side,
+                    "price": float(price),
+                    "model_prob": float(model_prob),
+                    "edge": float(edge),
+                    "fee": float(fee),
+                    "slippage": float(settings.slippage_buffer),
+                    "pnl": float(pnl),
+                    "event_type": row.get("event_type") or row.get("last_play_type"),
+                    "raw_payload": {"state": row, "candle": candle},
+                }
+                trades.append(trade)
+                store.append_json("candle_trades", trade)
+    finally:
+        store.close()
+    equity = []
+    running = 0.0
+    for trade in trades:
+        running += float(trade["pnl"])
+        equity.append(running)
+    metrics = [
+        {"metric": "sample_count", "value": feasibility["metrics"]["market_game_overlap_count"]},
+        {"metric": "trade_count", "value": len(trades)},
+        {"metric": "fill_proxy_count", "value": len(trades)},
+        {"metric": "gross_pnl", "value": round(sum(float(trade["pnl"]) + float(trade["fee"]) + float(trade["slippage"]) for trade in trades), 6)},
+        {"metric": "net_pnl", "value": round(sum(float(trade["pnl"]) for trade in trades), 6)},
+        {"metric": "fees", "value": round(sum(float(trade["fee"]) for trade in trades), 6)},
+        {"metric": "slippage_assumption", "value": float(settings.slippage_buffer)},
+        {"metric": "win_rate", "value": round(sum(1 for trade in trades if float(trade["pnl"]) > 0) / len(trades), 6) if trades else 0},
+        {"metric": "avg_edge_at_entry", "value": round(sum(float(trade["edge"]) for trade in trades) / len(trades), 6) if trades else 0},
+        {"metric": "max_drawdown", "value": round(_drawdown(equity), 6)},
+        {"metric": "by_market_results", "value": _result_groups(trades, "ticker")},
+        {"metric": "by_event_type_results", "value": _result_groups(trades, "event_type")},
+    ]
+    write_markdown_table(md_path, "Candle Trading Backtest", metrics)
+    write_csv(csv_path, trades)
+    _echo_json({"status": "COMPLETED", "metrics": metrics, "markdown": str(md_path), "csv": str(csv_path)})
 
 
 @app.command("report-edge")
@@ -1754,6 +2706,69 @@ def report_validation_summary(date: str = "today") -> None:
             "can_backtest_trading_strategy": can_trade,
             "missing_data": missing,
             "rows": rows,
+        }
+    )
+
+
+@app.command("report-season-validation-summary")
+def report_season_validation_summary(
+    start_date: Annotated[Optional[str], typer.Option("--start-date")] = None,
+    end_date: Annotated[Optional[str], typer.Option("--end-date")] = None,
+) -> None:
+    default_start, default_end = _default_season_dates()
+    start = parse_date_arg(start_date) if start_date else default_start
+    end = parse_date_arg(end_date) if end_date else default_end
+    feasibility = _season_feasibility(start, end)
+    model_result = _model_only_backtest_range(start, end)
+    model_status = model_result["status"]
+    if model_status == "MODEL_BASELINE_FAIL":
+        recommendation = "MODEL_FAILS_BASELINE"
+    elif not feasibility["model_only_ready"]:
+        recommendation = "CONTINUE_MODEL_DEVELOPMENT"
+    elif feasibility["metrics"]["candidate_market_count"] == 0:
+        recommendation = "MLB_MARKETS_NOT_AVAILABLE"
+    elif feasibility["metrics"]["matched_market_count"] == 0:
+        recommendation = "SEARCH_FOR_ALTERNATIVE_MARKETS"
+    elif not feasibility["full_orderbook_replay_ready"]:
+        recommendation = "COLLECT_LIVE_ORDERBOOK_DATA"
+    else:
+        recommendation = "READY_FOR_LIVE_PAPER_TRADING"
+
+    probability_status = (
+        "MODEL_BASELINE_PASS"
+        if model_status == "MODEL_BASELINE_PASS"
+        else ("MODEL_BASELINE_FAIL" if model_status == "MODEL_BASELINE_FAIL" else "INSUFFICIENT_DATA")
+    )
+    market_data_status = (
+        "CANDLE_MARKET_REPLAY_READY"
+        if feasibility["candle_market_replay_ready"]
+        else ("MARKET_CANDIDATES_FOUND" if feasibility["metrics"]["candidate_market_count"] else "NO_MLB_MARKETS_FOUND")
+    )
+    trading_status = "READY" if feasibility["candle_market_replay_ready"] else "CANDLE_MARKET_REPLAY_NOT_AVAILABLE"
+    full_orderbook_status = "READY" if feasibility["full_orderbook_replay_ready"] else "NOT_AVAILABLE"
+    rows = [
+        {"metric": "probability_model_validation_status", "value": probability_status},
+        {"metric": "market_data_availability_status", "value": market_data_status},
+        {"metric": "trading_backtest_status", "value": trading_status},
+        {"metric": "full_orderbook_replay_status", "value": full_orderbook_status},
+        {"metric": "recommended_next_action", "value": recommendation},
+    ]
+    rows.extend({"metric": key, "value": value} for key, value in feasibility["metrics"].items())
+    directory = _season_report_dir()
+    md_path = directory / "season_validation_summary.md"
+    csv_path = directory / "season_validation_summary.csv"
+    write_markdown_table(md_path, "Season Validation Summary", rows)
+    write_csv(csv_path, rows)
+    _echo_json(
+        {
+            "probability_model_validation_status": probability_status,
+            "market_data_availability_status": market_data_status,
+            "trading_backtest_status": trading_status,
+            "full_orderbook_replay_status": full_orderbook_status,
+            "recommended_next_action": recommendation,
+            "metrics": feasibility["metrics"],
+            "markdown": str(md_path),
+            "csv": str(csv_path),
         }
     )
 

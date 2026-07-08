@@ -273,7 +273,7 @@ def test_model_only_backtest_with_final_states(monkeypatch, tmp_path) -> None:
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["status"] == "COMPLETED"
+    assert payload["status"] in {"MODEL_BASELINE_PASS", "MODEL_BASELINE_FAIL"}
     assert payload["sample_count"] == 2
     assert (reports_dir / target_date.isoformat() / "model_only_predictions.csv").exists()
 

@@ -49,5 +49,11 @@ class MLBClient:
         return games
 
     def live_game(self, game_pk: str) -> dict:
-        return self._get(f"/game/{game_pk}/feed/live")
-
+        try:
+            return self._get(f"/game/{game_pk}/feed/live")
+        except ExternalServiceError:
+            v11_url = str(self.settings.mlb_base_url).replace("/api/v1", "/api/v1.1")
+            response = self._client.get(f"{v11_url}/game/{game_pk}/feed/live")
+            if response.status_code >= 400:
+                raise ExternalServiceError(f"MLB GET /game/{game_pk}/feed/live failed: {response.status_code} {response.text}")
+            return response.json()

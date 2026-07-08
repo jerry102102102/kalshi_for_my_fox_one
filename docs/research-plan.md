@@ -27,6 +27,22 @@ uv run --no-editable ksr report-pnl --run-id <RUN_ID>
 
 Use `uv run --no-editable` so the console script is built as an installed package instead of a broken editable `src/` path.
 
+## Season-To-Date Validation
+
+Use this workflow when the goal is research validation rather than today's live run:
+
+```bash
+uv run --no-editable ksr build-mlb-season-database --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr backtest-model-only --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr build-kalshi-historical-database --start-date 2026-03-01 --end-date 2026-07-07 --keywords baseball,MLB,Yankees,Rays,Cubs,Orioles,Dodgers,Mets,Astros,Giants,Phillies,Reds,Nationals,"Blue Jays"
+uv run --no-editable ksr report-season-market-mapping --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr report-trading-backtest-feasibility --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr backtest-trading-candle-level --start-date 2026-03-01 --end-date 2026-07-07
+uv run --no-editable ksr report-season-validation-summary
+```
+
+Season outputs are under `data/reports/season_to_date/`. `backtest-trading-candle-level` must return `CANDLE_MARKET_REPLAY_NOT_AVAILABLE` instead of fake PnL when mapped Kalshi MLB markets, candles, or market/game overlap are missing.
+
 ## Required Outputs
 
 - `data/parquet/*.parquet`
@@ -43,6 +59,15 @@ Use `uv run --no-editable` so the console script is built as an installed packag
 - `data/reports/<date>/market_replay_readiness.md/csv`
 - `data/reports/<date>/first_real_validation_summary.md/csv`
 - `data/reports/<date>/pnl_<RUN_ID>.md/csv`
+- `data/reports/season_to_date/model_only_backtest.md`
+- `data/reports/season_to_date/model_only_predictions.csv`
+- `data/reports/season_to_date/calibration_bins.csv`
+- `data/reports/season_to_date/market_mapping_report.md`
+- `data/reports/season_to_date/market_mapping_candidates.csv`
+- `data/reports/season_to_date/trading_backtest_feasibility.md/csv`
+- `data/reports/season_to_date/candle_trading_backtest.md`
+- `data/reports/season_to_date/candle_trades.csv`
+- `data/reports/season_to_date/season_validation_summary.md/csv`
 
 ## Go / No-Go Gates
 
@@ -67,4 +92,6 @@ Use `uv run --no-editable` so the console script is built as an installed packag
 - No mid-price fills. Use executable VWAP.
 - Missing live MLB games, mappings, or Kalshi markets must produce blocking reasons.
 - Empty replay must produce `INSUFFICIENT_BACKTEST_DATA`, not fake PnL.
+- Missing season market data must produce `CANDLE_MARKET_REPLAY_NOT_AVAILABLE`, not fake candle-level PnL.
+- Historical full orderbook replay requires live-recorded orderbook snapshots over the game window.
 - Taker-only replay comes first. Maker simulation waits until real fills/trades justify it.

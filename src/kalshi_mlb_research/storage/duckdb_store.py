@@ -81,6 +81,12 @@ class DuckDBStore:
               pitcher_id VARCHAR,
               last_play_type VARCHAR,
               last_play_description VARCHAR,
+              play_index INTEGER,
+              event_type VARCHAR,
+              description VARCHAR,
+              home_final_score INTEGER,
+              away_final_score INTEGER,
+              home_win_label INTEGER,
               raw_payload VARCHAR,
               state VARCHAR
             );
@@ -101,6 +107,64 @@ class DuckDBStore:
         )
         self.conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS mlb_games (
+              game_date DATE,
+              game_pk VARCHAR,
+              game_time_utc TIMESTAMP,
+              home_team VARCHAR,
+              away_team VARCHAR,
+              status VARCHAR,
+              home_final_score INTEGER,
+              away_final_score INTEGER,
+              home_win_label INTEGER,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mlb_plays (
+              observed_at_utc TIMESTAMP,
+              game_date DATE,
+              game_pk VARCHAR,
+              play_index INTEGER,
+              inning INTEGER,
+              half_inning VARCHAR,
+              outs INTEGER,
+              balls INTEGER,
+              strikes INTEGER,
+              runner_on_first BOOLEAN,
+              runner_on_second BOOLEAN,
+              runner_on_third BOOLEAN,
+              home_score INTEGER,
+              away_score INTEGER,
+              batter_id VARCHAR,
+              pitcher_id VARCHAR,
+              event_type VARCHAR,
+              description VARCHAR,
+              home_final_score INTEGER,
+              away_final_score INTEGER,
+              home_win_label INTEGER,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mlb_final_results (
+              game_date DATE,
+              game_pk VARCHAR,
+              home_team VARCHAR,
+              away_team VARCHAR,
+              home_final_score INTEGER,
+              away_final_score INTEGER,
+              home_win_label INTEGER,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS sports_events (
               observed_at_utc TIMESTAMP,
               game_pk VARCHAR,
@@ -110,6 +174,87 @@ class DuckDBStore:
               after_state VARCHAR,
               raw_payload VARCHAR,
               event VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalshi_markets (
+              ticker VARCHAR,
+              title VARCHAR,
+              event_title VARCHAR,
+              series_ticker VARCHAR,
+              category VARCHAR,
+              status VARCHAR,
+              market_date DATE,
+              open_time TIMESTAMP,
+              close_time TIMESTAMP,
+              source VARCHAR,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalshi_market_game_candidates (
+              ticker VARCHAR,
+              title VARCHAR,
+              event_title VARCHAR,
+              series_ticker VARCHAR,
+              market_date DATE,
+              candidate_game_pk VARCHAR,
+              home_team VARCHAR,
+              away_team VARCHAR,
+              match_score DOUBLE,
+              match_reason VARCHAR,
+              requires_manual_review BOOLEAN,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalshi_market_candles (
+              observed_at_utc TIMESTAMP,
+              ticker VARCHAR,
+              end_period_ts BIGINT,
+              period_interval INTEGER,
+              yes_bid_close DOUBLE,
+              yes_ask_close DOUBLE,
+              source VARCHAR,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kalshi_trades (
+              observed_at_utc TIMESTAMP,
+              trade_id VARCHAR,
+              ticker VARCHAR,
+              yes_price DOUBLE,
+              count INTEGER,
+              source VARCHAR,
+              raw_payload VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candle_trades (
+              observed_at_utc TIMESTAMP,
+              run_id VARCHAR,
+              game_pk VARCHAR,
+              ticker VARCHAR,
+              side VARCHAR,
+              price DOUBLE,
+              model_prob DOUBLE,
+              edge DOUBLE,
+              fee DOUBLE,
+              slippage DOUBLE,
+              pnl DOUBLE,
+              event_type VARCHAR,
+              raw_payload VARCHAR
             );
             """
         )
@@ -259,6 +404,7 @@ class DuckDBStore:
             "kalshi_ws_raw": {"source": "VARCHAR"},
             "mlb_game_states": {
                 "game_date": "DATE",
+                "play_index": "INTEGER",
                 "home_team": "VARCHAR",
                 "away_team": "VARCHAR",
                 "status": "VARCHAR",
@@ -276,6 +422,11 @@ class DuckDBStore:
                 "pitcher_id": "VARCHAR",
                 "last_play_type": "VARCHAR",
                 "last_play_description": "VARCHAR",
+                "event_type": "VARCHAR",
+                "description": "VARCHAR",
+                "home_final_score": "INTEGER",
+                "away_final_score": "INTEGER",
+                "home_win_label": "INTEGER",
                 "raw_payload": "VARCHAR",
             },
             "sports_events": {
