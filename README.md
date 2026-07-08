@@ -10,11 +10,11 @@ This project does not place real-money orders and does not capture, scrape, OCR,
 uv venv --python 3.11
 source .venv/bin/activate
 uv pip install ".[dev]"
-uv run pytest
-uv run ksr --help
+uv run --no-editable pytest
+uv run --no-editable ksr --help
 ```
 
-Use non-editable install (`uv pip install ".[dev]"`) for the `ksr` console script.
+Use `uv run --no-editable` for the `ksr` console script so it is installed as a package instead of relying on editable `src/` path handling.
 
 ## 2. Kalshi Credentials
 
@@ -29,7 +29,7 @@ export KALSHI_PRIVATE_KEY_PATH="/secure/path/kalshi.key"
 Check auth:
 
 ```bash
-uv run ksr check-kalshi-auth
+uv run --no-editable ksr check-kalshi-auth
 ```
 
 Expected failure without credentials:
@@ -46,14 +46,14 @@ The private key is read from disk and never logged.
 Record live games for today:
 
 ```bash
-uv run ksr record-mlb --date today --duration 1800
-uv run ksr inspect-mlb-games --date today
+uv run --no-editable ksr record-mlb --date today --duration 1800
+uv run --no-editable ksr inspect-mlb-games --date today
 ```
 
 If there are no live games, the command stores the schedule and prints `no live games currently` plus the next scheduled game time. To target one game:
 
 ```bash
-uv run ksr record-mlb --date today --game-pk <GAME_PK> --duration 1800
+uv run --no-editable ksr record-mlb --date today --game-pk <GAME_PK> --duration 1800
 ```
 
 ## 4. Kalshi Recording
@@ -61,14 +61,14 @@ uv run ksr record-mlb --date today --game-pk <GAME_PK> --duration 1800
 Find candidate markets:
 
 ```bash
-uv run ksr discover-markets --query mlb --status open
+uv run --no-editable ksr discover-markets --query mlb --status open
 ```
 
 Record a real ticker:
 
 ```bash
-uv run ksr record-kalshi --tickers <REAL_KALSHI_TICKER> --duration 1800 --book-snapshots-interval 30
-uv run ksr inspect-book --ticker <REAL_KALSHI_TICKER>
+uv run --no-editable ksr record-kalshi --tickers <REAL_KALSHI_TICKER> --duration 1800 --book-snapshots-interval 30
+uv run --no-editable ksr inspect-book --ticker <REAL_KALSHI_TICKER>
 ```
 
 Recorder behavior:
@@ -83,8 +83,8 @@ Recorder behavior:
 Do not rely on fuzzy matching for first-pass research. Manually map a real MLB game to a real Kalshi ticker:
 
 ```bash
-uv run ksr map-market --game-pk <GAME_PK> --ticker <KALSHI_TICKER> --market-type GAME_WINNER --manual
-uv run ksr inspect-mapping --date today
+uv run --no-editable ksr map-market --game-pk <GAME_PK> --ticker <KALSHI_TICKER> --market-type GAME_WINNER --manual
+uv run --no-editable ksr inspect-mapping --date today
 ```
 
 If the ticker title does not appear to match the game teams, the mapping is still stored but marked with a warning.
@@ -94,9 +94,13 @@ If the ticker title does not appear to match the game teams, the mapping is stil
 Reports use stored DuckDB rows, not fixed text.
 
 ```bash
-uv run ksr report-data-quality --date today
-uv run ksr report-latency --date today
-uv run ksr report-edge --date today
+uv run --no-editable ksr record-odds --sport mlb --date today
+uv run --no-editable ksr report-data-quality --date today
+uv run --no-editable ksr report-latency --date today
+uv run --no-editable ksr report-edge --date today
+uv run --no-editable ksr compare-latency --date today
+uv run --no-editable ksr report-validation-summary --date today
+uv run --no-editable ksr export-parquet
 ```
 
 Outputs:
@@ -108,6 +112,11 @@ data/reports/<date>/latency_report.md
 data/reports/<date>/latency_events.csv
 data/reports/<date>/edge_report.md
 data/reports/<date>/edge_samples.csv
+data/reports/<date>/latency_comparison.md
+data/reports/<date>/latency_comparison.csv
+data/reports/<date>/first_real_validation_summary.md
+data/reports/<date>/first_real_validation_summary.csv
+data/parquet/*.parquet
 ```
 
 If data is insufficient, reports say why, for example: no mapped markets, no MLB events, or no Kalshi snapshots around event windows.
@@ -117,8 +126,8 @@ If data is insufficient, reports say why, for example: no mapped markets, no MLB
 Paper trading uses stored MLB states, manual mappings, and Kalshi books. It does not place live orders.
 
 ```bash
-uv run ksr paper-trade --date today --duration 1800
-uv run ksr report-pnl --run-id <RUN_ID>
+uv run --no-editable ksr paper-trade --date today --duration 1800
+uv run --no-editable ksr report-pnl --run-id <RUN_ID>
 ```
 
 Written tables include `paper_orders`, `paper_fills`, `paper_positions`, `paper_equity`, and `skip_log`.
@@ -128,7 +137,7 @@ Written tables include `paper_orders`, `paper_fills`, `paper_positions`, `paper_
 Replay applies a latency delay to stored MLB state timestamps and uses executable VWAP from the recorded Kalshi book.
 
 ```bash
-uv run ksr replay --date today --latency-ms 1000
+uv run --no-editable ksr replay --date today --latency-ms 1000
 ```
 
 Output includes `run_id`, trade/fill/skip counts, fees, PnL fields, and drawdown placeholder.
@@ -150,4 +159,3 @@ Output includes `run_id`, trade/fill/skip counts, fees, PnL fields, and drawdown
 - `No live games currently`: choose a time with active MLB games or record a different date/game.
 - `no mapped markets`: run `map-market --manual`.
 - To confirm this is not demo placeholder output, inspect DuckDB/report rows for real tickers, real MLB `game_pk`, nonzero snapshot/state counts, and `source_mode` values.
-

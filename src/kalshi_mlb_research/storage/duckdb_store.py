@@ -124,6 +124,22 @@ class DuckDBStore:
         )
         self.conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS pregame_priors (
+              observed_at_utc TIMESTAMP,
+              event_id VARCHAR,
+              game_pk VARCHAR,
+              home_team VARCHAR,
+              away_team VARCHAR,
+              home_no_vig_prior DOUBLE,
+              away_no_vig_prior DOUBLE,
+              bookmaker_count INTEGER,
+              home_moneyline_range VARCHAR,
+              away_moneyline_range VARCHAR
+            );
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS model_predictions (
               observed_at_utc TIMESTAMP,
               game_pk VARCHAR,

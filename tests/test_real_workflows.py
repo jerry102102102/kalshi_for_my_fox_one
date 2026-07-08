@@ -177,3 +177,77 @@ def test_replay_deterministic_with_latency(monkeypatch, tmp_path) -> None:
     comparable = ["latency_ms", "trade_count", "fill_count", "skip_count", "gross_pnl", "estimated_fees"]
     assert {key: first[key] for key in comparable} == {key: second[key] for key in comparable}
 
+
+def test_validation_summary_empty_data(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["report-validation-summary", "--date", utc_now().date().isoformat()])
+
+    assert result.exit_code == 0, result.output
+    assert "first_real_validation_summary.md" in result.output
+    assert "NO_DATA" in result.output
+
+
+def test_compare_latency_empty_data(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["compare-latency", "--date", utc_now().date().isoformat()])
+
+    assert result.exit_code == 0, result.output
+    assert "latency_comparison.md" in result.output
+
+
+def test_record_odds_missing_key_is_blocker(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+    monkeypatch.delenv("ODDS_API_KEY", raising=False)
+
+    result = CliRunner().invoke(app, ["record-odds", "--sport", "mlb", "--date", utc_now().date().isoformat()])
+
+    assert result.exit_code == 1
+    assert "ODDS_API_KEY is required" in result.output
+
+
+def test_record_odds_stores_pregame_prior(monkeypatch, tmp_path) -> None:
+    _configure_tmp(monkeypatch, tmp_path)
+
+    class FakeOddsClient:
+        def odds(self, sport):
+            assert sport == "baseball_mlb"
+            return [
+                {
+                    "id": "odds-event-1",
+                    "home_team": "New York Yankees",
+                    "away_team": "Boston Red Sox",
+                    "bookmakers": [
+                        {
+                            "markets": [
+                                {
+                                    "key": "h2h",
+                                    "outcomes": [
+                                        {"name": "New York Yankees", "price": -120},
+                                        {"name": "Boston Red Sox", "price": 110},
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("kalshi_mlb_research.cli.OddsClient", FakeOddsClient)
+
+    result = CliRunner().invoke(app, ["record-odds", "--sport", "mlb", "--date", utc_now().date().isoformat()])
+
+    assert result.exit_code == 0, result.output
+    store = DuckDBStore()
+    try:
+        snapshots = store.fetch_all("SELECT * FROM odds_snapshots")
+        priors = store.fetch_all("SELECT * FROM pregame_priors")
+    finally:
+        store.close()
+    assert snapshots[0]["event_id"] == "odds-event-1"
+    assert priors[0]["event_id"] == "odds-event-1"
+    assert priors[0]["bookmaker_count"] == 1

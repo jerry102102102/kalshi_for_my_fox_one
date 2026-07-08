@@ -29,6 +29,8 @@ from kalshi_mlb_research.mlb.schemas import MLBGameState
 from kalshi_mlb_research.mlb.state_parser import MLBStateParser
 from kalshi_mlb_research.mlb.team_mapping import team_similarity
 from kalshi_mlb_research.models.baseline_mlb_wp import MLBWinProbabilityModel
+from kalshi_mlb_research.odds.client import OddsClient
+from kalshi_mlb_research.odds.prior import build_pregame_prior
 from kalshi_mlb_research.research_io import (
     book_depth,
     book_from_normalized_json,
@@ -40,6 +42,7 @@ from kalshi_mlb_research.research_io import (
     yes_mid_from_row,
 )
 from kalshi_mlb_research.storage.duckdb_store import DuckDBStore
+from kalshi_mlb_research.storage.parquet_writer import ParquetWriter
 from kalshi_mlb_research.time_utils import ensure_utc, parse_date_arg, parse_iso_datetime, utc_now
 
 app = typer.Typer(help="Kalshi MLB research CLI.")
@@ -295,17 +298,19 @@ async def _record_kalshi_websocket(
     raw: bool,
     snapshot_interval: int,
     store_path: str,
-) -> int:
+) -> tuple[int, int]:
     store = DuckDBStore(path=load_settings().duckdb_path if not store_path else load_settings().duckdb_path)
     rest = KalshiRestClient()
     ws = KalshiWebSocketClient()
     snapshot_count = 0
+    raw_message_count = 0
     last_snapshot = 0.0
 
     async def handler(message: dict) -> None:
-        nonlocal snapshot_count, last_snapshot
+        nonlocal snapshot_count, raw_message_count, last_snapshot
         ticker = str(message.get("msg", {}).get("market_ticker") or message.get("market_ticker") or "")
         channel = str(message.get("type") or message.get("channel") or "")
+        raw_message_count += 1
         store.append_json(
             "kalshi_ws_raw",
             {
@@ -331,7 +336,7 @@ async def _record_kalshi_websocket(
     finally:
         rest.close()
         store.close()
-    return snapshot_count
+    return snapshot_count, raw_message_count
 
 
 @app.command("record-kalshi")
@@ -376,9 +381,11 @@ def record_kalshi(
     if can_try_ws and duration > 0:
         try:
             source_mode = "websocket"
-            snapshot_count += asyncio.run(
+            ws_snapshots, ws_messages = asyncio.run(
                 _record_kalshi_websocket(ticker_list, duration, raw, max(1, book_snapshots_interval), "")
             )
+            snapshot_count += ws_snapshots
+            raw_message_count += ws_messages
         except Exception as exc:
             source_mode = "polling"
             blockers.append(f"websocket unavailable; fell back to REST polling: {exc}")
@@ -679,6 +686,54 @@ def _report_paths(target_date: Date, stem: str) -> tuple[Any, Any]:
     return directory / f"{stem}.md", directory / f"{stem}.csv"
 
 
+@app.command("record-odds")
+def record_odds(sport: str = "mlb", date: str = "today") -> None:
+    sport_key = "baseball_mlb" if sport.lower() in {"mlb", "baseball"} else sport
+    store = DuckDBStore()
+    client = OddsClient()
+    count = 0
+    priors = 0
+    try:
+        events = client.odds(sport=sport_key)
+        for event in events:
+            store.append_json(
+                "odds_snapshots",
+                {"observed_at_utc": utc_now(), "event_id": event.get("id"), "snapshot": event},
+            )
+            count += 1
+            prior = build_pregame_prior(event)
+            if prior:
+                prior_row = asdict(prior)
+                prior_row["event_id"] = event.get("id")
+                store.append_json("pregame_priors", prior_row)
+                priors += 1
+    except Exception as exc:
+        _echo_json({"sport": sport_key, "date": parse_date_arg(date), "recorded_events": count, "blocking_reason": str(exc)})
+        raise typer.Exit(1)
+    finally:
+        client.close()
+        store.close()
+    _echo_json({"sport": sport_key, "date": parse_date_arg(date), "recorded_events": count, "pregame_priors": priors})
+
+
+@app.command("export-parquet")
+def export_parquet() -> None:
+    settings = load_settings()
+    writer = ParquetWriter(settings)
+    store = DuckDBStore()
+    try:
+        tables = [row["name"] for row in store.fetch_all("SHOW TABLES")]
+    finally:
+        store.close()
+    outputs = []
+    for table in tables:
+        try:
+            outputs.append(str(writer.export_table(settings.duckdb_path, table)))
+        except Exception as exc:
+            outputs.append(f"{table}: skipped ({exc})")
+    _echo_json({"parquet_dir": str(settings.parquet_dir), "outputs": outputs})
+
+
 @app.command("report-data-quality")
 def report_data_quality(date: str = "today") -> None:
     target_date = parse_date_arg(date)
@@ -971,6 +1026,86 @@ def paper_trade(date: str = "today", duration: int = 3600) -> None:
 @app.command("replay")
 def replay(date: Annotated[str, typer.Option("--date")], latency_ms: int = 1000) -> None:
     _echo_json(_run_paper_replay(parse_date_arg(date), latency_ms))
+
+
+@app.command("compare-latency")
+def compare_latency(date: Annotated[str, typer.Option("--date")]) -> None:
+    target_date = parse_date_arg(date)
+    rows = [_run_paper_replay(target_date, latency) for latency in [100, 250, 500, 1000, 2000, 5000, 10000, 30000]]
+    md_path, csv_path = _report_paths(target_date, "latency_comparison")
+    write_markdown_table(md_path, "Latency Comparison", rows)
+    write_csv(csv_path, rows)
+    _echo_json({"markdown": str(md_path), "csv": str(csv_path), "rows": rows})
+
+
+def _gate_status(value: float | int | None, go: float, no_go: float, higher_is_better: bool) -> str:
+    if value is None:
+        return "NO_DATA"
+    if higher_is_better:
+        if value >= go:
+            return "GO"
+        if value < no_go:
+            return "NO_GO"
+        return "WATCH"
+    if value <= go:
+        return "GO"
+    if value > no_go:
+        return "NO_GO"
+    return "WATCH"
+
+
+@app.command("report-validation-summary")
+def report_validation_summary(date: str = "today") -> None:
+    target_date = parse_date_arg(date)
+    store = DuckDBStore()
+    try:
+        metrics = store.fetch_all(
+            """
+            SELECT
+              (SELECT COUNT(DISTINCT game_pk) FROM market_game_mappings) AS mapped_games,
+              (SELECT COUNT(*) FROM sports_events WHERE CAST(observed_at_utc AS DATE)=? AND event_type IN ('RUN_SCORED','HOME_RUN','PITCHING_CHANGE')) AS high_impact_events,
+              (SELECT COUNT(*) FROM mlb_game_states WHERE game_date=?) AS state_snapshots,
+              (SELECT COALESCE(median(yes_spread), 999) FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE)=?) AS median_spread,
+              (SELECT COALESCE(avg(yes_spread), 999) FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE)=?) AS average_spread,
+              (SELECT COALESCE(median(yes_bid_depth), 0) FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE)=?) AS median_bid_depth,
+              (SELECT COALESCE(median(yes_ask_depth), 0) FROM kalshi_orderbook_snapshots WHERE CAST(observed_at_utc AS DATE)=?) AS median_ask_depth
+            """,
+            [target_date.isoformat()] * 6,
+        )[0]
+        gap_rows = store.fetch_all(
+            """
+            WITH gaps AS (
+              SELECT observed_at_utc,
+                     observed_at_utc - LAG(observed_at_utc) OVER (PARTITION BY ticker ORDER BY observed_at_utc) AS gap
+              FROM kalshi_orderbook_snapshots
+              WHERE CAST(observed_at_utc AS DATE)=?
+            )
+            SELECT COUNT(gap) AS gap_count,
+                   SUM(CASE WHEN EXTRACT(EPOCH FROM gap) * 1000 > ? THEN 1 ELSE 0 END) AS stale_gap_count
+            FROM gaps
+            """,
+            [target_date.isoformat(), load_settings().max_data_staleness_ms],
+        )[0]
+    finally:
+        store.close()
+    gap_count = int(gap_rows.get("gap_count") or 0)
+    stale_ratio = (int(gap_rows.get("stale_gap_count") or 0) / gap_count) if gap_count else None
+    rows = [
+        {"gate": "mapped_games", "value": metrics["mapped_games"], "go": 100, "no_go": 30, "status": _gate_status(metrics["mapped_games"], 100, 30, True)},
+        {"gate": "high_impact_events", "value": metrics["high_impact_events"], "go": 1000, "no_go": 300, "status": _gate_status(metrics["high_impact_events"], 1000, 300, True)},
+        {"gate": "state_snapshots", "value": metrics["state_snapshots"], "go": 5000, "no_go": 1500, "status": _gate_status(metrics["state_snapshots"], 5000, 1500, True)},
+        {"gate": "kalshi_stale_ratio", "value": round(stale_ratio, 4) if stale_ratio is not None else None, "go": 0.20, "no_go": 0.35, "status": _gate_status(stale_ratio, 0.20, 0.35, False)},
+        {"gate": "median_spread", "value": metrics["median_spread"], "go": 0.05, "no_go": 0.08, "status": _gate_status(float(metrics["median_spread"]), 0.05, 0.08, False)},
+        {"gate": "average_spread", "value": metrics["average_spread"], "go": 0.08, "no_go": 0.12, "status": _gate_status(float(metrics["average_spread"]), 0.08, 0.12, False)},
+        {"gate": "median_yes_bid_depth", "value": metrics["median_bid_depth"], "go": 5, "no_go": 3, "status": _gate_status(metrics["median_bid_depth"], 5, 3, True)},
+        {"gate": "median_yes_ask_depth", "value": metrics["median_ask_depth"], "go": 5, "no_go": 3, "status": _gate_status(metrics["median_ask_depth"], 5, 3, True)},
+    ]
+    directory = report_dir(load_settings().reports_dir, target_date)
+    md_path = directory / "first_real_validation_summary.md"
+    csv_path = directory / "first_real_validation_summary.csv"
+    write_markdown_table(md_path, "First Real Validation Summary", rows)
+    write_csv(csv_path, rows)
+    _echo_json({"markdown": str(md_path), "csv": str(csv_path), "rows": rows})
 
 
 @app.command("report-pnl")
